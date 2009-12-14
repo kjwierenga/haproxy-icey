@@ -361,11 +361,17 @@ const char http_is_token[256] = {
  * An http ver_token is any ASCII which can be found in an HTTP version,
  * which includes 'H', 'T', 'P', '/', '.' and any digit.
  */
+/*
+ * Also accept 'I', 'C', 'E', and 'Y' as valid tokens
+ * to accept ICE/1.0 and ICY/666 as valid version strings
+ */
 const char http_is_ver_token[256] = {
 	['.'] = 1, ['/'] = 1,
 	['0'] = 1, ['1'] = 1, ['2'] = 1, ['3'] = 1, ['4'] = 1,
 	['5'] = 1, ['6'] = 1, ['7'] = 1, ['8'] = 1, ['9'] = 1,
 	['H'] = 1, ['P'] = 1, ['T'] = 1,
+	
+	['I'] = 1, ['C'] = 1, ['E'] = 1, ['Y'] = 1,
 };
 
 
