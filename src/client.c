@@ -1,7 +1,7 @@
 /*
  * Client-side variables and functions.
  *
- * Copyright 2000-2008 Willy Tarreau <w@1wt.eu>
+ * Copyright 2000-2010 Willy Tarreau <w@1wt.eu>
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License
@@ -32,6 +32,9 @@
 #include <proto/fd.h>
 #include <proto/log.h>
 #include <proto/hdr_idx.h>
+#include <proto/pattern.h>
+#include <proto/protocols.h>
+#include <proto/proto_tcp.h>
 #include <proto/proto_http.h>
 #include <proto/proxy.h>
 #include <proto/session.h>
@@ -107,14 +110,23 @@ int event_accept(int fd) {
 			}
 		}
 
+		if (l->nbconn >= l->maxconn) {
+			/* too many connections, we shoot this one and return.
+			 * FIXME: it would be better to simply switch the listener's
+			 * state to LI_FULL and disable the FD. We could re-enable
+			 * it upon fd_delete(), but this requires all protocols to
+			 * be switched.
+			 */
+			goto out_close;
+		}
+
 		if ((s = pool_alloc2(pool2_session)) == NULL) { /* disable this proxy for a while */
 			Alert("out of memory in event_accept().\n");
-			EV_FD_CLR(fd, DIR_RD);
+			disable_listener(l);
 			p->state = PR_STIDLE;
 			goto out_close;
 		}
 
-		LIST_ADDQ(&sessions, &s->list);
 		LIST_INIT(&s->back_refs);
 
 		s->flags = 0;
@@ -134,9 +146,11 @@ int event_accept(int fd) {
 			s->flags |= SN_MONITOR;
 		}
 
+		LIST_ADDQ(&sessions, &s->list);
+
 		if ((t = task_new()) == NULL) { /* disable this proxy for a while */
 			Alert("out of memory in event_accept().\n");
-			EV_FD_CLR(fd, DIR_RD);
+			disable_listener(l);
 			p->state = PR_STIDLE;
 			goto out_free_session;
 		}
@@ -160,37 +174,40 @@ int event_accept(int fd) {
 		if (p->options & PR_O_TCP_NOLING)
 			setsockopt(cfd, SOL_SOCKET, SO_LINGER, (struct linger *) &nolinger, sizeof(struct linger));
 
+		if (global.tune.client_sndbuf)
+			setsockopt(cfd, SOL_SOCKET, SO_SNDBUF, &global.tune.client_sndbuf, sizeof(global.tune.client_sndbuf));
+
+		if (global.tune.client_rcvbuf)
+			setsockopt(cfd, SOL_SOCKET, SO_RCVBUF, &global.tune.client_rcvbuf, sizeof(global.tune.client_rcvbuf));
+
 		t->process = l->handler;
 		t->context = s;
+		t->nice = l->nice;
 
 		s->task = t;
 		s->listener = l;
+
+		/* Note: initially, the session's backend points to the frontend.
+		 * This changes later when switching rules are executed or
+		 * when the default backend is assigned.
+		 */
 		s->be = s->fe = p;
 
-		/* in HTTP mode, content switching requires that the backend
-		 * first points to the same proxy as the frontend. However, in
-		 * TCP mode there will be no header processing so any default
-		 * backend must be assigned if set.
-		 */
-		if (p->mode == PR_MODE_TCP) {
-			if (p->defbe.be)
-				s->be = p->defbe.be;
-			s->flags |= SN_BE_ASSIGNED;
-		}
-
-		s->ana_state = 0;  /* analysers may change it but must reset it upon exit */
 		s->req = s->rep = NULL; /* will be allocated later */
 
 		s->si[0].state = s->si[0].prev_state = SI_ST_EST;
 		s->si[0].err_type = SI_ET_NONE;
 		s->si[0].err_loc = NULL;
 		s->si[0].owner = t;
+		s->si[0].update = stream_sock_data_finish;
 		s->si[0].shutr = stream_sock_shutr;
 		s->si[0].shutw = stream_sock_shutw;
 		s->si[0].chk_rcv = stream_sock_chk_rcv;
 		s->si[0].chk_snd = stream_sock_chk_snd;
+		s->si[0].connect = NULL;
+		s->si[0].iohandler = NULL;
 		s->si[0].fd = cfd;
-		s->si[0].flags = SI_FL_NONE;
+		s->si[0].flags = SI_FL_NONE | SI_FL_CAP_SPLTCP; /* TCP splicing capable */
 		if (s->fe->options2 & PR_O2_INDEPSTR)
 			s->si[0].flags |= SI_FL_INDEP_STR;
 		s->si[0].exp = TICK_ETERNITY;
@@ -199,10 +216,13 @@ int event_accept(int fd) {
 		s->si[1].err_type = SI_ET_NONE;
 		s->si[1].err_loc = NULL;
 		s->si[1].owner = t;
+		s->si[1].update = stream_sock_data_finish;
 		s->si[1].shutr = stream_sock_shutr;
 		s->si[1].shutw = stream_sock_shutw;
 		s->si[1].chk_rcv = stream_sock_chk_rcv;
 		s->si[1].chk_snd = stream_sock_chk_snd;
+		s->si[1].connect = tcpv4_connect_server;
+		s->si[1].iohandler = NULL;
 		s->si[1].exp = TICK_ETERNITY;
 		s->si[1].fd = -1; /* just to help with debugging */
 		s->si[1].flags = SI_FL_NONE;
@@ -212,6 +232,9 @@ int event_accept(int fd) {
 		s->srv = s->prev_srv = s->srv_conn = NULL;
 		s->pend_pos = NULL;
 		s->conn_retries = s->be->conn_retries;
+
+		/* init store persistence */
+		s->store_count = 0;
 
 		/* FIXME: the logs are horribly complicated now, because they are
 		 * defined in <p>, <p>, and later <be> and <be>.
@@ -227,10 +250,8 @@ int event_accept(int fd) {
 		else
 			s->do_log = tcp_sess_log;
 
-		if (p->mode == PR_MODE_HTTP)
-			s->srv_error = http_return_srv_error;
-		else
-			s->srv_error = default_srv_error;
+		/* default error reporting function, may be changed by analysers */
+		s->srv_error = default_srv_error;
 
 		s->logs.accept_date = date; /* user-visible date for logging */
 		s->logs.tv_accept = now;  /* corrected date for internal use */
@@ -246,14 +267,14 @@ int event_accept(int fd) {
 		s->data_source = DATA_SRC_NONE;
 
 		s->uniq_id = totalconn;
-		proxy_inc_fe_ctr(p);	/* note: cum_beconn will be increased once assigned */
+		proxy_inc_fe_ctr(l, p);	/* note: cum_beconn will be increased once assigned */
 
 		txn = &s->txn;
-		txn->flags = 0;
 		/* Those variables will be checked and freed if non-NULL in
 		 * session.c:session_free(). It is important that they are
 		 * properly initialized.
 		 */
+		txn->sessid = NULL;
 		txn->srv_cookie = NULL;
 		txn->cli_cookie = NULL;
 		txn->uri = NULL;
@@ -263,42 +284,28 @@ int event_accept(int fd) {
 		txn->hdr_idx.size = txn->hdr_idx.used = 0;
 
 		if (p->mode == PR_MODE_HTTP) {
-			txn->status = -1;
-			txn->req.hdr_content_len = 0LL;
-			txn->rsp.hdr_content_len = 0LL;
-			txn->req.msg_state = HTTP_MSG_RQBEFORE; /* at the very beginning of the request */
-			txn->rsp.msg_state = HTTP_MSG_RPBEFORE; /* at the very beginning of the response */
-			txn->req.sol = txn->req.eol = NULL;
-			txn->req.som = txn->req.eoh = 0; /* relative to the buffer */
-			txn->rsp.sol = txn->rsp.eol = NULL;
-			txn->rsp.som = txn->rsp.eoh = 0; /* relative to the buffer */
-			txn->req.err_pos = txn->rsp.err_pos = -2; /* block buggy requests/responses */
-			if (p->options2 & PR_O2_REQBUG_OK)
-				txn->req.err_pos = -1; /* let buggy requests pass */
-			txn->auth_hdr.len = -1;
-
-			if (p->nb_req_cap > 0) {
-				if ((txn->req.cap = pool_alloc2(p->req_cap_pool)) == NULL)
+			/* the captures are only used in HTTP frontends */
+			if (p->nb_req_cap > 0 &&
+			    (txn->req.cap = pool_alloc2(p->req_cap_pool)) == NULL)
 					goto out_fail_reqcap;	/* no memory */
 
-				memset(txn->req.cap, 0, p->nb_req_cap*sizeof(char *));
-			}
-
-
-			if (p->nb_rsp_cap > 0) {
-				if ((txn->rsp.cap = pool_alloc2(p->rsp_cap_pool)) == NULL)
+			if (p->nb_rsp_cap > 0 &&
+			    (txn->rsp.cap = pool_alloc2(p->rsp_cap_pool)) == NULL)
 					goto out_fail_rspcap;	/* no memory */
+		}
 
-				memset(txn->rsp.cap, 0, p->nb_rsp_cap*sizeof(char *));
-			}
-
-
+		if (p->acl_requires & ACL_USE_L7_ANY) {
+			/* we have to allocate header indexes only if we know
+			 * that we may make use of them. This of course includes
+			 * (mode == PR_MODE_HTTP).
+			 */
 			txn->hdr_idx.size = MAX_HTTP_HDR;
 
 			if ((txn->hdr_idx.v = pool_alloc2(p->hdr_idx_pool)) == NULL)
 				goto out_fail_idx; /* no memory */
 
-			hdr_idx_init(&txn->hdr_idx);
+			/* and now initialize the HTTP transaction state */
+			http_init_txn(s);
 		}
 
 		if ((p->mode == PR_MODE_TCP || p->mode == PR_MODE_HTTP)
@@ -370,12 +377,13 @@ int event_accept(int fd) {
 					      pn, ntohs(((struct sockaddr_in6 *)(&s->cli_addr))->sin6_port));
 			}
 
-			write(1, trash, len);
+			if (write(1, trash, len) < 0) /* shut gcc warning */;
 		}
 
 		if ((s->req = pool_alloc2(pool2_buffer)) == NULL)
 			goto out_fail_req; /* no memory */
 
+		s->req->size = global.tune.bufsize;
 		buffer_init(s->req);
 		s->req->prod = &s->si[0];
 		s->req->cons = &s->si[1];
@@ -383,16 +391,17 @@ int event_accept(int fd) {
 
 		s->req->flags |= BF_READ_ATTACHED; /* the producer is already connected */
 
-		if (p->mode == PR_MODE_HTTP) { /* reserve some space for header rewriting */
-			s->req->max_len -= MAXREWRITE;
+		if (p->mode == PR_MODE_HTTP)
 			s->req->flags |= BF_READ_DONTWAIT; /* one read is usually enough */
-		}
 
 		/* activate default analysers enabled for this listener */
 		s->req->analysers = l->analysers;
 
-		if (!s->req->analysers)
-			buffer_write_ena(s->req);  /* don't wait to establish connection */
+		/* note: this should not happen anymore since there's always at least the switching rules */
+		if (!s->req->analysers) {
+			buffer_auto_connect(s->req);  /* don't wait to establish connection */
+			buffer_auto_close(s->req);    /* let the producer forward close requests */
+		}
 
 		s->req->rto = s->fe->timeout.client;
 		s->req->wto = s->be->timeout.server;
@@ -401,10 +410,17 @@ int event_accept(int fd) {
 		if ((s->rep = pool_alloc2(pool2_buffer)) == NULL)
 			goto out_fail_rep; /* no memory */
 
+		s->rep->size = global.tune.bufsize;
 		buffer_init(s->rep);
 		s->rep->prod = &s->si[1];
 		s->rep->cons = &s->si[0];
 		s->si[0].ob = s->si[1].ib = s->rep;
+		s->rep->analysers = 0;
+
+		if (s->fe->options2 & PR_O2_NODELAY) {
+			s->req->flags |= BF_NEVER_WAIT;
+			s->rep->flags |= BF_NEVER_WAIT;
+		}
 
 		s->rep->rto = s->be->timeout.server;
 		s->rep->wto = s->fe->timeout.client;
@@ -421,12 +437,16 @@ int event_accept(int fd) {
 		fd_insert(cfd);
 		fdtab[cfd].owner = &s->si[0];
 		fdtab[cfd].state = FD_STREADY;
+		fdtab[cfd].flags = FD_FL_TCP | FD_FL_TCP_NODELAY;
+		if (p->options & PR_O_TCP_NOLING)
+			fdtab[cfd].flags |= FD_FL_TCP_NOLING;
+
 		fdtab[cfd].cb[DIR_RD].f = l->proto->read;
 		fdtab[cfd].cb[DIR_RD].b = s->req;
 		fdtab[cfd].cb[DIR_WR].f = l->proto->write;
 		fdtab[cfd].cb[DIR_WR].b = s->rep;
-		fdtab[cfd].peeraddr = (struct sockaddr *)&s->cli_addr;
-		fdtab[cfd].peerlen = sizeof(s->cli_addr);
+		fdinfo[cfd].peeraddr = (struct sockaddr *)&s->cli_addr;
+		fdinfo[cfd].peerlen = sizeof(s->cli_addr);
 
 		if ((p->mode == PR_MODE_HTTP && (s->flags & SN_MONITOR)) ||
 		    (p->mode == PR_MODE_HEALTH && (p->options & PR_O_HTTP_CHK))) {
@@ -434,13 +454,15 @@ int event_accept(int fd) {
 			 * or we're in health check mode with the 'httpchk' option enabled. In
 			 * both cases, we return a fake "HTTP/1.0 200 OK" response and we exit.
 			 */
-			struct chunk msg = { .str = "HTTP/1.0 200 OK\r\n\r\n", .len = 19 };
+			struct chunk msg;
+			chunk_initstr(&msg, "HTTP/1.0 200 OK\r\n\r\n");
 			stream_int_retnclose(&s->si[0], &msg); /* forge a 200 response */
 			s->req->analysers = 0;
 			t->expire = s->rep->wex;
 		}
 		else if (p->mode == PR_MODE_HEALTH) {  /* health check mode, no client reading */
-			struct chunk msg = { .str = "OK\n", .len = 3 };
+			struct chunk msg;
+			chunk_initstr(&msg, "OK\n");
 			stream_int_retnclose(&s->si[0], &msg); /* forge an "OK" response */
 			s->req->analysers = 0;
 			t->expire = s->rep->wex;
@@ -455,16 +477,21 @@ int event_accept(int fd) {
 		 */
 		task_wakeup(t, TASK_WOKEN_INIT);
 
-		p->feconn++;  /* beconn will be increased later */
-		if (p->feconn > p->feconn_max)
-			p->feconn_max = p->feconn;
-
-		if (s->flags & SN_BE_ASSIGNED) {
-			proxy_inc_be_ctr(s->be);
-			s->be->beconn++;
-			if (s->be->beconn > s->be->beconn_max)
-				s->be->beconn_max = s->be->beconn;
+		l->nbconn++; /* warning! right now, it's up to the handler to decrease this */
+		if (l->nbconn >= l->maxconn) {
+			EV_FD_CLR(l->fd, DIR_RD);
+			l->state = LI_FULL;
 		}
+
+		p->feconn++;  /* beconn will be increased later */
+		if (p->feconn > p->counters.feconn_max)
+			p->counters.feconn_max = p->feconn;
+
+		if (l->counters) {
+			if (l->nbconn > l->counters->conn_max)
+				l->counters->conn_max = l->nbconn;
+		}
+
 		actconn++;
 		totalconn++;
 
@@ -512,8 +539,17 @@ acl_fetch_src(struct proxy *px, struct session *l4, void *l7, int dir,
 	return 1;
 }
 
+/* extract the connection's source address */
+static int
+pattern_fetch_src(struct proxy *px, struct session *l4, void *l7, int dir,
+                  const char *arg, int arg_len, union pattern_data *data)
+{
+	data->ip.s_addr = ((struct sockaddr_in *)&l4->cli_addr)->sin_addr.s_addr;
+	return 1;
+}
 
-/* set test->i to the connexion's source port */
+
+/* set test->i to the connection's source port */
 static int
 acl_fetch_sport(struct proxy *px, struct session *l4, void *l7, int dir,
                 struct acl_expr *expr, struct acl_test *test)
@@ -545,6 +581,18 @@ acl_fetch_dst(struct proxy *px, struct session *l4, void *l7, int dir,
 }
 
 
+/* extract the connection's destination address */
+static int
+pattern_fetch_dst(struct proxy *px, struct session *l4, void *l7, int dir,
+                  const char *arg, int arg_len, union pattern_data *data)
+{
+	if (!(l4->flags & SN_FRT_ADDR_SET))
+		get_frt_addr(l4);
+
+	data->ip.s_addr = ((struct sockaddr_in *)&l4->frt_addr)->sin_addr.s_addr;
+	return 1;
+}
+
 /* set test->i to the frontend connexion's destination port */
 static int
 acl_fetch_dport(struct proxy *px, struct session *l4, void *l7, int dir,
@@ -561,6 +609,17 @@ acl_fetch_dport(struct proxy *px, struct session *l4, void *l7, int dir,
 	return 1;
 }
 
+static int
+pattern_fetch_dport(struct proxy *px, struct session *l4, void *l7, int dir,
+                    const char *arg, int arg_len, union pattern_data *data)
+
+{
+	if (!(l4->flags & SN_FRT_ADDR_SET))
+		get_frt_addr(l4);
+
+	data->integer = ntohs(((struct sockaddr_in *)&l4->frt_addr)->sin_port);
+	return 1;
+}
 
 /* set test->i to the number of connexions to the same listening socket */
 static int
@@ -571,18 +630,53 @@ acl_fetch_dconn(struct proxy *px, struct session *l4, void *l7, int dir,
 	return 1;
 }
 
+/* set test->i to the id of the frontend */
+static int
+acl_fetch_fe_id(struct proxy *px, struct session *l4, void *l7, int dir,
+                struct acl_expr *expr, struct acl_test *test) {
+
+	test->flags = ACL_TEST_F_READ_ONLY;
+
+	test->i = l4->fe->uuid;
+
+	return 1;
+}
+
+/* set test->i to the id of the socket (listener) */
+static int
+acl_fetch_so_id(struct proxy *px, struct session *l4, void *l7, int dir,
+                struct acl_expr *expr, struct acl_test *test) {
+
+	test->flags = ACL_TEST_F_READ_ONLY;
+
+	test->i = l4->listener->luid;
+
+	return 1;
+}
+
 
 /* Note: must not be declared <const> as its list will be overwritten */
 static struct acl_kw_list acl_kws = {{ },{
 	{ "src_port",   acl_parse_int,   acl_fetch_sport,    acl_match_int, ACL_USE_TCP_PERMANENT  },
-	{ "src",        acl_parse_ip,    acl_fetch_src,      acl_match_ip,  ACL_USE_TCP4_PERMANENT },
-	{ "dst",        acl_parse_ip,    acl_fetch_dst,      acl_match_ip,  ACL_USE_TCP4_PERMANENT },
+	{ "src",        acl_parse_ip,    acl_fetch_src,      acl_match_ip,  ACL_USE_TCP4_PERMANENT|ACL_MAY_LOOKUP },
+	{ "dst",        acl_parse_ip,    acl_fetch_dst,      acl_match_ip,  ACL_USE_TCP4_PERMANENT|ACL_MAY_LOOKUP },
 	{ "dst_port",   acl_parse_int,   acl_fetch_dport,    acl_match_int, ACL_USE_TCP_PERMANENT  },
 #if 0
 	{ "src_limit",  acl_parse_int,   acl_fetch_sconn,    acl_match_int },
 #endif
 	{ "dst_conn",   acl_parse_int,   acl_fetch_dconn,    acl_match_int, ACL_USE_NOTHING },
+	{ "fe_id",      acl_parse_int,   acl_fetch_fe_id,    acl_match_int, ACL_USE_NOTHING },
+	{ "so_id",      acl_parse_int,   acl_fetch_so_id,    acl_match_int, ACL_USE_NOTHING },
 	{ NULL, NULL, NULL, NULL },
+}};
+
+
+/* Note: must not be declared <const> as its list will be overwritten */
+static struct pattern_fetch_kw_list pattern_fetch_keywords = {{ },{
+	{ "src",       pattern_fetch_src,   PATTERN_TYPE_IP,      PATTERN_FETCH_REQ },
+	{ "dst",       pattern_fetch_dst,   PATTERN_TYPE_IP,      PATTERN_FETCH_REQ },
+	{ "dst_port",  pattern_fetch_dport, PATTERN_TYPE_INTEGER, PATTERN_FETCH_REQ },
+	{ NULL, NULL, 0, 0 },
 }};
 
 
@@ -590,6 +684,7 @@ __attribute__((constructor))
 static void __client_init(void)
 {
 	acl_register_keywords(&acl_kws);
+	pattern_register_fetches(&pattern_fetch_keywords);
 }
 
 

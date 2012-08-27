@@ -3,7 +3,7 @@
   This file contains definitions of some primitives to dedicated to
   statistics output.
 
-  Copyright (C) 2000-2008 Willy Tarreau - w@1wt.eu
+  Copyright (C) 2000-2009 Willy Tarreau - w@1wt.eu
 
   This library is free software; you can redistribute it and/or
   modify it under the terms of the GNU Lesser General Public
@@ -33,23 +33,44 @@
 #define STAT_SHOW_INFO  0x00000004	/* dump the info part */
 #define STAT_HIDE_DOWN  0x00000008	/* hide 'down' servers in the stats page */
 #define STAT_NO_REFRESH 0x00000010	/* do not automatically refresh the stats page */
+#define STAT_ADMIN      0x00000020	/* indicate a stats admin level */
 #define STAT_BOUND      0x00800000	/* bound statistics to selected proxies/types/services */
 
 #define STATS_TYPE_FE  0
 #define STATS_TYPE_BE  1
 #define STATS_TYPE_SV  2
+#define STATS_TYPE_SO  3
 
-#define STATS_ST_INIT  0
-#define STATS_ST_REQ   1
-#define STATS_ST_REP   2
-#define STATS_ST_CLOSE 3
+/* unix stats socket states */
+#define STAT_CLI_INIT   0   /* initial state */
+#define STAT_CLI_END    1   /* final state, let's close */
+#define STAT_CLI_GETREQ 2   /* wait for a request */
+#define STAT_CLI_OUTPUT 3   /* all states after this one are responses */
+#define STAT_CLI_PROMPT 3   /* display the prompt (first output, same code) */
+#define STAT_CLI_PRINT  4   /* display message in cli->msg */
 
-int stats_dump_raw(struct session *s, struct buffer *rep, struct uri_auth *uri);
-void stats_dump_raw_to_buffer(struct session *s, struct buffer *req);
+#define STAT_CLI_O_INFO 5   /* dump info/stats */
+#define STAT_CLI_O_SESS 6   /* dump sessions */
+#define STAT_CLI_O_ERR  7   /* dump errors */
+
+/* status codes (strictly 4 chars) used in the URL to display a message */
+#define STAT_STATUS_UNKN "UNKN"	/* an unknown error occured, shouldn't happen */
+#define STAT_STATUS_DONE "DONE"	/* the action is successful */
+#define STAT_STATUS_PART "PART"	/* the action is partially successful */
+#define STAT_STATUS_NONE "NONE"	/* nothing happened (no action chosen or servers state didn't change) */
+#define STAT_STATUS_ERRP "ERRP"	/* an error occured due to invalid values in parameters */
+#define STAT_STATUS_EXCD "EXCD"	/* an error occured because the buffer couldn't store all data */
+#define STAT_STATUS_DENY "DENY"	/* action denied */
+
+
+int stats_sock_parse_request(struct stream_interface *si, char *line);
+void stats_io_handler(struct stream_interface *si);
+int stats_dump_raw_to_buffer(struct session *s, struct buffer *rep);
 int stats_dump_http(struct session *s, struct buffer *rep, struct uri_auth *uri);
 int stats_dump_proxy(struct session *s, struct proxy *px, struct uri_auth *uri);
-void stats_dump_sess_to_buffer(struct session *s, struct buffer *rep);
-void stats_dump_errors_to_buffer(struct session *s, struct buffer *rep);
+int stats_dump_sess_to_buffer(struct session *s, struct buffer *rep);
+int stats_dump_errors_to_buffer(struct session *s, struct buffer *rep);
+void http_stats_io_handler(struct stream_interface *si);
 
 
 #endif /* _PROTO_DUMPSTATS_H */

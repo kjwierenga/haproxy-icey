@@ -1,23 +1,23 @@
 /*
-  include/proto/proto_http.h
-  This file contains HTTP protocol definitions.
-
-  Copyright (C) 2000-2008 Willy Tarreau - w@1wt.eu
-
-  This library is free software; you can redistribute it and/or
-  modify it under the terms of the GNU Lesser General Public
-  License as published by the Free Software Foundation, version 2.1
-  exclusively.
-
-  This library is distributed in the hope that it will be useful,
-  but WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public
-  License along with this library; if not, write to the Free Software
-  Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
-*/
+ * include/proto/proto_http.h
+ * This file contains HTTP protocol definitions.
+ *
+ * Copyright (C) 2000-2010 Willy Tarreau - w@1wt.eu
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation, version 2.1
+ * exclusively.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
+ */
 
 #ifndef _PROTO_PROTO_HTTP_H
 #define _PROTO_PROTO_HTTP_H
@@ -61,34 +61,51 @@ int event_accept(int fd);
 int process_cli(struct session *t);
 int process_srv_data(struct session *t);
 int process_srv_conn(struct session *t);
-int http_process_request(struct session *t, struct buffer *req);
-int http_process_tarpit(struct session *s, struct buffer *req);
-int http_process_request_body(struct session *s, struct buffer *req);
-int process_response(struct session *t);
+int http_wait_for_request(struct session *s, struct buffer *req, int an_bit);
+int http_process_req_common(struct session *s, struct buffer *req, int an_bit, struct proxy *px);
+int http_process_request(struct session *t, struct buffer *req, int an_bit);
+int http_process_tarpit(struct session *s, struct buffer *req, int an_bit);
+int http_process_request_body(struct session *s, struct buffer *req, int an_bit);
+int http_send_name_header(struct http_txn *txn, struct http_msg *msg, struct buffer *buf, struct proxy* be, const char* svr_name);
+int http_wait_for_response(struct session *s, struct buffer *rep, int an_bit);
+int http_process_res_common(struct session *t, struct buffer *rep, int an_bit, struct proxy *px);
+int http_request_forward_body(struct session *s, struct buffer *req, int an_bit);
+int http_response_forward_body(struct session *s, struct buffer *res, int an_bit);
 
-void produce_content(struct session *s, struct buffer *rep);
-int produce_content_stats(struct session *s);
-int produce_content_stats_proxy(struct session *s, struct proxy *px);
 void debug_hdr(const char *dir, struct session *t, const char *start, const char *end);
 void get_srv_from_appsession(struct session *t, const char *begin, int len);
 int apply_filter_to_req_headers(struct session *t, struct buffer *req, struct hdr_exp *exp);
 int apply_filter_to_req_line(struct session *t, struct buffer *req, struct hdr_exp *exp);
-int apply_filters_to_request(struct session *t, struct buffer *req, struct hdr_exp *exp);
-int apply_filters_to_response(struct session *t, struct buffer *rtr, struct hdr_exp *exp);
+int apply_filters_to_request(struct session *s, struct buffer *req, struct proxy *px);
+int apply_filters_to_response(struct session *t, struct buffer *rtr, struct proxy *px);
+void manage_client_side_appsession(struct session *t, const char *buf, int len);
 void manage_client_side_cookies(struct session *t, struct buffer *req);
 void manage_server_side_cookies(struct session *t, struct buffer *rtr);
 void check_response_for_cacheability(struct session *t, struct buffer *rtr);
-int stats_check_uri_auth(struct session *t, struct proxy *backend);
+int stats_check_uri(struct session *s, struct proxy *backend);
 void init_proto_http();
 int http_find_header2(const char *name, int len,
-		      const char *sol, struct hdr_idx *idx,
+		      char *sol, struct hdr_idx *idx,
 		      struct hdr_ctx *ctx);
 void http_sess_log(struct session *s);
 void perform_http_redirect(struct session *s, struct stream_interface *si);
 void http_return_srv_error(struct session *s, struct stream_interface *si);
 void http_capture_bad_message(struct error_snapshot *es, struct session *s,
                               struct buffer *buf, struct http_msg *msg,
-			      struct proxy *other_end);
+			      int state, struct proxy *other_end);
+unsigned int get_ip_from_hdr2(struct http_msg *msg, const char *hname, int hlen,
+			      struct hdr_idx *idx, int occ);
+
+void http_init_txn(struct session *s);
+void http_end_txn(struct session *s);
+void http_reset_txn(struct session *s);
+
+/* to be used when contents change in an HTTP message */
+#define http_msg_move_end(msg, bytes) do { \
+		unsigned int _bytes = (bytes);	\
+		(msg)->sov += (_bytes);		\
+		(msg)->eoh += (_bytes);		\
+	} while (0)
 
 #endif /* _PROTO_PROTO_HTTP_H */
 

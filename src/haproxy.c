@@ -1,6 +1,6 @@
 /*
  * HA-Proxy : High Availability-enabled HTTP/TCP proxy
- * Copyright 2000-2009  Willy Tarreau <w@1wt.eu>.
+ * Copyright 2000-2012  Willy Tarreau <w@1wt.eu>.
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License
@@ -22,15 +22,6 @@
  *   - a proxy with an invalid config will prevent the startup even if disabled.
  *
  * ChangeLog has moved to the CHANGELOG file.
- *
- * TODO:
- *   - handle properly intermediate incomplete server headers. Done ?
- *   - handle hot-reconfiguration
- *   - fix client/server state transition when server is in connect or headers state
- *     and client suddenly disconnects. The server *should* switch to SHUT_WR, but
- *     still handle HTTP headers.
- *   - remove MAX_NEWHDR
- *   - cut this huge file into several ones
  *
  */
 
@@ -76,6 +67,7 @@
 #include <types/capture.h>
 #include <types/global.h>
 
+#include <proto/auth.h>
 #include <proto/acl.h>
 #include <proto/backend.h>
 #include <proto/buffers.h>
@@ -93,10 +85,6 @@
 #include <proto/stream_sock.h>
 #include <proto/task.h>
 
-#ifdef CONFIG_HAP_TCPSPLICE
-#include <libtcpsplice.h>
-#endif
-
 #ifdef CONFIG_HAP_CTTPROXY
 #include <proto/cttproxy.h>
 #endif
@@ -105,9 +93,8 @@
 
 /*********************************************************************/
 
-static int cfg_nbcfgfiles;      /* number of config files */
-static char *cfg_cfgfile[10];	/* configuration files, stop at NULL */
-char *progname = NULL;		/* program name */
+/* list of config files */
+static struct list cfg_cfgfiles = LIST_HEAD_INIT(cfg_cfgfiles);
 int  pid;			/* current process id */
 int  relative_pid = 1;		/* process id starting at 1 */
 
@@ -117,9 +104,7 @@ struct global global = {
 	logfac2 : -1,
 	loglev1 : 7, /* max syslog level : debug */
 	loglev2 : 7,
-	.stats_timeout = MS_TO_TICKS(10000), /* stats timeout = 10 seconds */
 	.stats_sock = {
-		.timeout = &global.stats_timeout,
 		.maxconn = 10, /* 10 concurrent stats connections */
 		.perm = {
 			 .ux = {
@@ -128,7 +113,12 @@ struct global global = {
 				 .mode = 0,
 			 }
 		 }
-	}
+	},
+	.tune = {
+		.bufsize = BUFSIZE,
+		.maxrewrite = MAXREWRITE,
+		.chksize = BUFSIZE,
+	},
 	/* others NULL OK */
 };
 
@@ -141,18 +131,24 @@ int stopping;	/* non zero means stopping in progress */
  * our ports. With 200 retries, that's about 2 seconds.
  */
 #define MAX_START_RETRIES	200
-static int nb_oldpids = 0;
 static int *oldpids = NULL;
 static int oldpids_sig; /* use USR1 or TERM */
 
 /* this is used to drain data, and as a temporary buffer for sprintf()... */
-char trash[BUFSIZE];
+char *trash = NULL;
+int trashlen = BUFSIZE;
 
+/* this buffer is always the same size as standard buffers and is used for
+ * swapping data inside a buffer.
+ */
+char *swap_buffer = NULL;
+
+int nb_oldpids = 0;
 const int zero = 0;
 const int one = 1;
 const struct linger nolinger = { .l_onoff = 1, .l_linger = 0 };
 
-char hostname[MAX_HOSTNAME_LEN] = "";
+char hostname[MAX_HOSTNAME_LEN];
 
 
 /*********************************************************************/
@@ -162,7 +158,7 @@ char hostname[MAX_HOSTNAME_LEN] = "";
 void display_version()
 {
 	printf("HA-Proxy version " HAPROXY_VERSION " " HAPROXY_DATE"\n");
-	printf("Copyright 2000-2009 Willy Tarreau <w@1wt.eu>\n\n");
+	printf("Copyright 2000-2012 Willy Tarreau <w@1wt.eu>\n\n");
 }
 
 void display_build_opts()
@@ -184,9 +180,19 @@ void display_build_opts()
 	       "\n  OPTIONS = " BUILD_OPTIONS
 #endif
 	       "\n\nDefault settings :"
-	       "\n  maxconn = %d, maxpollevents = %d"
+	       "\n  maxconn = %d, bufsize = %d, maxrewrite = %d, maxpollevents = %d"
 	       "\n\n",
-	       DEFAULT_MAXCONN, MAX_POLL_EVENTS);
+	       DEFAULT_MAXCONN, BUFSIZE, MAXREWRITE, MAX_POLL_EVENTS);
+
+	printf("Encrypted password support via crypt(3): "
+#ifdef CONFIG_HAP_CRYPT
+		"yes"
+#else
+		"no"
+#endif
+		"\n");
+
+	putchar('\n');
 
 	list_pollers(stdout);
 	putchar('\n');
@@ -224,7 +230,7 @@ void usage(char *name)
 #if defined(ENABLE_POLL)
 		"        -dp disables poll() usage even when available\n"
 #endif
-#if defined(CONFIG_HAP_LINUX_SPLICE) || defined(CONFIG_HAP_TCPSPLICE)
+#if defined(CONFIG_HAP_LINUX_SPLICE)
 		"        -dS disables splice usage (broken on old kernels)\n"
 #endif
 		"        -sf/-st [pid ]* finishes/terminates old pids. Must be last arguments.\n"
@@ -279,11 +285,11 @@ void sig_dump_state(int sig)
 
 		send_log(p, LOG_NOTICE, "SIGHUP received, dumping servers states for proxy %s.\n", p->id);
 		while (s) {
-			snprintf(trash, sizeof(trash),
+			snprintf(trash, trashlen,
 				 "SIGHUP: Server %s/%s is %s. Conn: %d act, %d pend, %lld tot.",
 				 p->id, s->id,
 				 (s->state & SRV_RUNNING) ? "UP" : "DOWN",
-				 s->cur_sess, s->nbpend, s->cum_sess);
+				 s->cur_sess, s->nbpend, s->counters.cum_sess);
 			Warning("%s\n", trash);
 			send_log(p, LOG_NOTICE, "%s\n", trash);
 			s = s->next;
@@ -291,22 +297,22 @@ void sig_dump_state(int sig)
 
 		/* FIXME: those info are a bit outdated. We should be able to distinguish between FE and BE. */
 		if (!p->srv) {
-			snprintf(trash, sizeof(trash),
+			snprintf(trash, trashlen,
 				 "SIGHUP: Proxy %s has no servers. Conn: act(FE+BE): %d+%d, %d pend (%d unass), tot(FE+BE): %lld+%lld.",
 				 p->id,
-				 p->feconn, p->beconn, p->totpend, p->nbpend, p->cum_feconn, p->cum_beconn);
+				 p->feconn, p->beconn, p->totpend, p->nbpend, p->counters.cum_feconn, p->counters.cum_beconn);
 		} else if (p->srv_act == 0) {
-			snprintf(trash, sizeof(trash),
+			snprintf(trash, trashlen,
 				 "SIGHUP: Proxy %s %s ! Conn: act(FE+BE): %d+%d, %d pend (%d unass), tot(FE+BE): %lld+%lld.",
 				 p->id,
 				 (p->srv_bck) ? "is running on backup servers" : "has no server available",
-				 p->feconn, p->beconn, p->totpend, p->nbpend, p->cum_feconn, p->cum_beconn);
+				 p->feconn, p->beconn, p->totpend, p->nbpend, p->counters.cum_feconn, p->counters.cum_beconn);
 		} else {
-			snprintf(trash, sizeof(trash),
+			snprintf(trash, trashlen,
 				 "SIGHUP: Proxy %s has %d active servers and %d backup servers available."
 				 " Conn: act(FE+BE): %d+%d, %d pend (%d unass), tot(FE+BE): %lld+%lld.",
 				 p->id, p->srv_act, p->srv_bck,
-				 p->feconn, p->beconn, p->totpend, p->nbpend, p->cum_feconn, p->cum_beconn);
+				 p->feconn, p->beconn, p->totpend, p->nbpend, p->counters.cum_feconn, p->counters.cum_beconn);
 		}
 		Warning("%s\n", trash);
 		send_log(p, LOG_NOTICE, "%s\n", trash);
@@ -387,17 +393,18 @@ void init(int argc, char **argv)
 {
 	int i;
 	int arg_mode = 0;	/* MODE_DEBUG, ... */
-	char *old_argv = *argv;
 	char *tmp;
 	char *cfg_pidfile = NULL;
 	int err_code = 0;
+	struct wordlist *wl;
+	char *progname;
 
 	/*
 	 * Initialize the previously static variables.
 	 */
     
 	totalconn = actconn = maxfd = listeners = stopping = 0;
-    
+	trash = malloc(trashlen);
 
 #ifdef HAPROXY_MEMMAX
 	global.rlimit_memmax = HAPROXY_MEMMAX;
@@ -409,7 +416,7 @@ void init(int argc, char **argv)
 	signal_init();
 	init_task();
 	init_session();
-	init_buffer();
+	/* warning, we init buffers later */
 	init_pendconn();
 	init_proto_http();
 
@@ -426,7 +433,7 @@ void init(int argc, char **argv)
 #if defined(ENABLE_KQUEUE)
 	global.tune.options |= GTUNE_USE_KQUEUE;
 #endif
-#if defined(CONFIG_HAP_LINUX_SPLICE) || defined(CONFIG_HAP_TCPSPLICE)
+#if defined(CONFIG_HAP_LINUX_SPLICE)
 	global.tune.options |= GTUNE_USE_SPLICE;
 #endif
 
@@ -434,6 +441,9 @@ void init(int argc, char **argv)
 	progname = *argv;
 	while ((tmp = strchr(progname, '/')) != NULL)
 		progname = tmp + 1;
+
+	/* the process name is used for the logs only */
+	global.log_tag = strdup(progname);
 
 	argc--; argv++;
 	while (argc > 0) {
@@ -465,7 +475,7 @@ void init(int argc, char **argv)
 			else if (*flag == 'd' && flag[1] == 'k')
 				global.tune.options &= ~GTUNE_USE_KQUEUE;
 #endif
-#if defined(CONFIG_HAP_LINUX_SPLICE) || defined(CONFIG_HAP_TCPSPLICE)
+#if defined(CONFIG_HAP_LINUX_SPLICE)
 			else if (*flag == 'd' && flag[1] == 'S')
 				global.tune.options &= ~GTUNE_USE_SPLICE;
 #endif
@@ -495,7 +505,7 @@ void init(int argc, char **argv)
 					while (argc > 0) {
 						oldpids[nb_oldpids] = atol(*argv);
 						if (oldpids[nb_oldpids] <= 0)
-							usage(old_argv);
+							usage(progname);
 						argc--; argv++;
 						nb_oldpids++;
 					}
@@ -504,27 +514,28 @@ void init(int argc, char **argv)
 			else { /* >=2 args */
 				argv++; argc--;
 				if (argc == 0)
-					usage(old_argv);
+					usage(progname);
 
 				switch (*flag) {
 				case 'n' : cfg_maxconn = atol(*argv); break;
 				case 'm' : global.rlimit_memmax = atol(*argv); break;
 				case 'N' : cfg_maxpconn = atol(*argv); break;
 				case 'f' :
-					if (cfg_nbcfgfiles > MAX_CFG_FILES) {
-						Alert("Cannot load configuration file %s : too many configuration files (max %d).\n",
-						      *argv, MAX_CFG_FILES);
+					wl = (struct wordlist *)calloc(1, sizeof(*wl));
+					if (!wl) {
+						Alert("Cannot load configuration file %s : out of memory.\n", *argv);
 						exit(1);
 					}
-					cfg_cfgfile[cfg_nbcfgfiles++] = *argv;
+					wl->s = *argv;
+					LIST_ADDQ(&cfg_cfgfiles, &wl->list);
 					break;
 				case 'p' : cfg_pidfile = *argv; break;
-				default: usage(old_argv);
+				default: usage(progname);
 				}
 			}
 		}
 		else
-			usage(old_argv);
+			usage(progname);
 		argv++; argc--;
 	}
 
@@ -532,20 +543,33 @@ void init(int argc, char **argv)
 		(arg_mode & (MODE_DAEMON | MODE_FOREGROUND | MODE_VERBOSE
 			     | MODE_QUIET | MODE_CHECK | MODE_DEBUG));
 
-	if (!cfg_nbcfgfiles)
-		usage(old_argv);
+	if (LIST_ISEMPTY(&cfg_cfgfiles))
+		usage(progname);
 
-	gethostname(hostname, MAX_HOSTNAME_LEN);
+	/* NB: POSIX does not make it mandatory for gethostname() to NULL-terminate
+	 * the string in case of truncation, and at least FreeBSD appears not to do
+	 * it.
+	 */
+	memset(hostname, 0, sizeof(hostname));
+	gethostname(hostname, sizeof(hostname) - 1);
 
 	have_appsession = 0;
 	global.maxsock = 10; /* reserve 10 fds ; will be incremented by socket eaters */
 
 	init_default_instance();
 
-	for (i = 0; i < cfg_nbcfgfiles; i++) {
-		err_code |= readcfgfile(cfg_cfgfile[i]);
-		if (err_code & (ERR_ABORT|ERR_FATAL))
-			Alert("Error(s) found in configuration file : %s\n", cfg_cfgfile[i]);
+	list_for_each_entry(wl, &cfg_cfgfiles, list) {
+		int ret;
+
+		ret = readcfgfile(wl->s);
+		if (ret == -1) {
+			Alert("Could not open configuration file %s : %s\n",
+			      wl->s, strerror(errno));
+			exit(1);
+		}
+		if (ret & (ERR_ABORT|ERR_FATAL))
+			Alert("Error(s) found in configuration file : %s\n", wl->s);
+		err_code |= ret;
 		if (err_code & ERR_ABORT)
 			exit(1);
 	}
@@ -560,6 +584,9 @@ void init(int argc, char **argv)
 		qfprintf(stdout, "Configuration file is valid\n");
 		exit(0);
 	}
+
+	/* now we know the buffer size, we can initialize the buffers */
+	init_buffer();
 
 	if (have_appsession)
 		appsession_init();
@@ -616,6 +643,9 @@ void init(int argc, char **argv)
 	if (global.tune.recv_enough == 0)
 		global.tune.recv_enough = MIN_RECV_AT_ONCE_ENOUGH;
 
+	if (global.tune.maxrewrite >= global.tune.bufsize / 2)
+		global.tune.maxrewrite = global.tune.bufsize / 2;
+
 	if (arg_mode & (MODE_DEBUG | MODE_FOREGROUND)) {
 		/* command line debug mode inhibits configuration mode */
 		global.mode &= ~(MODE_DAEMON | MODE_QUIET);
@@ -637,6 +667,10 @@ void init(int argc, char **argv)
 	if (global.nbproc < 1)
 		global.nbproc = 1;
 
+	swap_buffer = (char *)calloc(1, global.tune.bufsize);
+
+	fdinfo = (struct fdinfo *)calloc(1,
+				       sizeof(struct fdinfo) * (global.maxsock));
 	fdtab = (struct fdtab *)calloc(1,
 				       sizeof(struct fdtab) * (global.maxsock));
 	for (i = 0; i < global.maxsock; i++) {
@@ -692,8 +726,9 @@ void deinit(void)
 	struct acl *acl, *aclb;
 	struct switching_rule *rule, *ruleb;
 	struct redirect_rule *rdr, *rdrb;
+	struct wordlist *wl, *wlb;
+	struct cond_wordlist *cwl, *cwlb;
 	struct uri_auth *uap, *ua = NULL;
-	struct user_auth *user;
 	int i;
 
 	while (p) {
@@ -706,13 +741,19 @@ void deinit(void)
 		free(p->monitor_uri);
 
 		for (i = 0; i < HTTP_ERR_SIZE; i++)
-			free(p->errmsg[i].str);
+			chunk_destroy(&p->errmsg[i]);
 
-		for (i = 0; i < p->nb_reqadd; i++)
-			free(p->req_add[i]);
+		list_for_each_entry_safe(cwl, cwlb, &p->req_add, list) {
+			LIST_DEL(&cwl->list);
+			free(cwl->s);
+			free(cwl);
+		}
 
-		for (i = 0; i < p->nb_rspadd; i++)
-			free(p->rsp_add[i]);
+		list_for_each_entry_safe(cwl, cwlb, &p->rsp_add, list) {
+			LIST_DEL(&cwl->list);
+			free(cwl->s);
+			free(cwl);
+		}
 
 		list_for_each_entry_safe(cond, condb, &p->block_cond, list) {
 			LIST_DEL(&cond->list);
@@ -783,8 +824,10 @@ void deinit(void)
 
 		list_for_each_entry_safe(rdr, rdrb, &p->redirect_rules, list) {
 			LIST_DEL(&rdr->list);
-			prune_acl_cond(rdr->cond);
-			free(rdr->cond);
+			if (rdr->cond) {
+				prune_acl_cond(rdr->cond);
+				free(rdr->cond);
+			}
 			free(rdr->rdr_str);
 			free(rdr);
 		}
@@ -818,8 +861,14 @@ void deinit(void)
 				task_free(s->check);
 			}
 
+			if (s->warmup) {
+				task_delete(s->warmup);
+				task_free(s->warmup);
+			}
+
 			free(s->id);
 			free(s->cookie);
+			free(s->check_data);
 			free(s);
 			s = s_next;
 		}/* end while(s) */
@@ -827,13 +876,23 @@ void deinit(void)
 		l = p->listen;
 		while (l) {
 			l_next = l->next;
+			unbind_listener(l);
+			delete_listener(l);
+			free(l->name);
+			free(l->counters);
 			free(l);
 			l = l_next;
 		}/* end while(l) */
 
+		free(p->desc);
+		free(p->fwdfor_hdr_name);
+
+		req_acl_free(&p->req_acl);
+
 		pool_destroy2(p->req_cap_pool);
 		pool_destroy2(p->rsp_cap_pool);
 		pool_destroy2(p->hdr_idx_pool);
+
 		p0 = p;
 		p = p->next;
 		free(p0);
@@ -848,23 +907,29 @@ void deinit(void)
 		free(uap->node);
 		free(uap->desc);
 
-		while (uap->users) {
-			user = uap->users;
-			uap->users = uap->users->next;
-			free(user->user_pwd);
-			free(user);
-		}
+		userlist_free(uap->userlist);
+		req_acl_free(&uap->req_acl);
+
 		free(uap);
 	}
 
+	userlist_free(userlist);
+
 	protocol_unbind_all();
 
+	free(global.log_send_hostname); global.log_send_hostname = NULL;
+	free(global.log_tag); global.log_tag = NULL;
 	free(global.chroot);  global.chroot = NULL;
 	free(global.pidfile); global.pidfile = NULL;
 	free(global.node);    global.node = NULL;
 	free(global.desc);    global.desc = NULL;
 	free(fdtab);          fdtab   = NULL;
 	free(oldpids);        oldpids = NULL;
+
+	list_for_each_entry_safe(wl, wlb, &cfg_cfgfiles, list) {
+		LIST_DEL(&wl->list);
+		free(wl);
+	}
 
 	pool_destroy2(pool2_session);
 	pool_destroy2(pool2_buffer);
@@ -883,12 +948,17 @@ void deinit(void)
 
 } /* end deinit() */
 
-/* sends the signal <sig> to all pids found in <oldpids> */
-static void tell_old_pids(int sig)
+/* sends the signal <sig> to all pids found in <oldpids>. Returns the number of
+ * pids the signal was correctly delivered to.
+ */
+static int tell_old_pids(int sig)
 {
 	int p;
+	int ret = 0;
 	for (p = 0; p < nb_oldpids; p++)
-		kill(oldpids[p], sig);
+		if (kill(oldpids[p], sig) == 0)
+			ret++;
+	return ret;
 }
 
 /*
@@ -943,12 +1013,38 @@ int main(int argc, char **argv)
 	signal_register(SIGTERM, sig_term);
 #endif
 
-	/* on very high loads, a sigpipe sometimes happen just between the
-	 * getsockopt() which tells "it's OK to write", and the following write :-(
+	/* Always catch SIGPIPE even on platforms which define MSG_NOSIGNAL.
+	 * Some recent FreeBSD setups report broken pipes, and MSG_NOSIGNAL
+	 * was defined there, so let's stay on the safe side.
 	 */
-#if !MSG_NOSIGNAL || defined(CONFIG_HAP_LINUX_SPLICE)
 	signal(SIGPIPE, SIG_IGN);
+
+	/* ulimits */
+	if (!global.rlimit_nofile)
+		global.rlimit_nofile = global.maxsock;
+
+	if (global.rlimit_nofile) {
+		limit.rlim_cur = limit.rlim_max = global.rlimit_nofile;
+		if (setrlimit(RLIMIT_NOFILE, &limit) == -1) {
+			Warning("[%s.main()] Cannot raise FD limit to %d.\n", argv[0], global.rlimit_nofile);
+		}
+	}
+
+	if (global.rlimit_memmax) {
+		limit.rlim_cur = limit.rlim_max =
+			global.rlimit_memmax * 1048576 / global.nbproc;
+#ifdef RLIMIT_AS
+		if (setrlimit(RLIMIT_AS, &limit) == -1) {
+			Warning("[%s.main()] Cannot fix MEM limit to %d megs.\n",
+				argv[0], global.rlimit_memmax);
+		}
+#else
+		if (setrlimit(RLIMIT_DATA, &limit) == -1) {
+			Warning("[%s.main()] Cannot fix MEM limit to %d megs.\n",
+				argv[0], global.rlimit_memmax);
+		}
 #endif
+	}
 
 	/* We will loop at most 100 times with 10 ms delay each time.
 	 * That's at most 1 second. We only send a signal to old pids
@@ -962,14 +1058,18 @@ int main(int argc, char **argv)
 		/* exit the loop on no error or fatal error */
 		if ((err & (ERR_RETRYABLE|ERR_FATAL)) != ERR_RETRYABLE)
 			break;
-		if (nb_oldpids == 0)
+		if (nb_oldpids == 0 || retry == 0)
 			break;
 
 		/* FIXME-20060514: Solaris and OpenBSD do not support shutdown() on
 		 * listening sockets. So on those platforms, it would be wiser to
 		 * simply send SIGUSR1, which will not be undoable.
 		 */
-		tell_old_pids(SIGTTOU);
+		if (tell_old_pids(SIGTTOU) == 0) {
+			/* no need to wait if we can't contact old pids */
+			retry = 0;
+			continue;
+		}
 		/* give some time to old processes to stop listening */
 		w.tv_sec = 0;
 		w.tv_usec = 10*1000;
@@ -1028,47 +1128,6 @@ int main(int argc, char **argv)
 		pidfile = fdopen(pidfd, "w");
 	}
 
-	/* ulimits */
-	if (!global.rlimit_nofile)
-		global.rlimit_nofile = global.maxsock;
-
-	if (global.rlimit_nofile) {
-		limit.rlim_cur = limit.rlim_max = global.rlimit_nofile;
-		if (setrlimit(RLIMIT_NOFILE, &limit) == -1) {
-			Warning("[%s.main()] Cannot raise FD limit to %d.\n", argv[0], global.rlimit_nofile);
-		}
-	}
-
-	if (global.rlimit_memmax) {
-		limit.rlim_cur = limit.rlim_max =
-			global.rlimit_memmax * 1048576 / global.nbproc;
-#ifdef RLIMIT_AS
-		if (setrlimit(RLIMIT_AS, &limit) == -1) {
-			Warning("[%s.main()] Cannot fix MEM limit to %d megs.\n",
-				argv[0], global.rlimit_memmax);
-		}
-#else
-		if (setrlimit(RLIMIT_DATA, &limit) == -1) {
-			Warning("[%s.main()] Cannot fix MEM limit to %d megs.\n",
-				argv[0], global.rlimit_memmax);
-		}
-#endif
-	}
-
-#ifdef CONFIG_HAP_TCPSPLICE
-	if ((global.tune.options & GTUNE_USE_SPLICE) && (global.last_checks & LSTCHK_TCPSPLICE)) {
-		if (tcp_splice_start() < 0) {
-			Alert("[%s.main()] Cannot enable tcp_splice.\n"
-			      "  Make sure you have enough permissions and that the module is loadable.\n"
-			      "  Alternatively, you may disable the 'tcpsplice' options in the configuration\n"
-			      "  or add 'nosplice' in the global section, or start with '-dS'.\n"
-			      "", argv[0]);
-			protocol_unbind_all();
-			exit(1);
-		}
-	}
-#endif
-
 #ifdef CONFIG_HAP_CTTPROXY
 	if (global.last_checks & LSTCHK_CTTPROXY) {
 		int ret;
@@ -1102,18 +1161,17 @@ int main(int argc, char **argv)
 
 	/* chroot if needed */
 	if (global.chroot != NULL) {
-		if (chroot(global.chroot) == -1) {
+		if (chroot(global.chroot) == -1 || chdir("/") == -1) {
 			Alert("[%s.main()] Cannot chroot(%s).\n", argv[0], global.chroot);
 			if (nb_oldpids)
 				tell_old_pids(SIGTTIN);
 			protocol_unbind_all();
 			exit(1);
 		}
-		chdir("/");
 	}
 
 	if (nb_oldpids)
-		tell_old_pids(oldpids_sig);
+		nb_oldpids = tell_old_pids(oldpids_sig);
 
 	/* Note that any error at this stage will be fatal because we will not
 	 * be able to restart the old pids.
@@ -1164,8 +1222,11 @@ int main(int argc, char **argv)
 		/* close the pidfile both in children and father */
 		if (pidfile != NULL)
 			fclose(pidfile);
-		free(global.pidfile);
-		global.pidfile = NULL;
+
+		/* We won't ever use this anymore */
+		free(oldpids);        oldpids = NULL;
+		free(global.chroot);  global.chroot = NULL;
+		free(global.pidfile); global.pidfile = NULL;
 
 		/* we might have to unbind some proxies from some processes */
 		px = proxy;

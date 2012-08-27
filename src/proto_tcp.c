@@ -1,7 +1,7 @@
 /*
  * AF_INET/AF_INET6 SOCK_STREAM protocol layer (tcp)
  *
- * Copyright 2000-2008 Willy Tarreau <w@1wt.eu>
+ * Copyright 2000-2010 Willy Tarreau <w@1wt.eu>
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License
@@ -24,6 +24,8 @@
 #include <sys/types.h>
 #include <sys/un.h>
 
+#include <netinet/tcp.h>
+
 #include <common/cfgparse.h>
 #include <common/compat.h>
 #include <common/config.h>
@@ -36,11 +38,15 @@
 #include <common/version.h>
 
 #include <types/global.h>
+#include <types/server.h>
 
 #include <proto/acl.h>
 #include <proto/backend.h>
 #include <proto/buffers.h>
+#include <proto/checks.h>
 #include <proto/fd.h>
+#include <proto/log.h>
+#include <proto/port_range.h>
 #include <proto/protocols.h>
 #include <proto/proto_tcp.h>
 #include <proto/proxy.h>
@@ -124,6 +130,7 @@ int tcpv4_bind_socket(int fd, int flags, struct sockaddr_in *local, struct socka
 #endif
 	if (flags) {
 		memset(&bind_addr, 0, sizeof(bind_addr));
+		bind_addr.sin_family = AF_INET;
 		if (flags & 1)
 			bind_addr.sin_addr = remote->sin_addr;
 		if (flags & 2)
@@ -171,6 +178,257 @@ int tcpv4_bind_socket(int fd, int flags, struct sockaddr_in *local, struct socka
 	return 0;
 }
 
+
+/*
+ * This function initiates a connection to the server assigned to this session
+ * (s->srv, s->srv_addr). It will assign a server if none is assigned yet. A
+ * source address may be pointed to by <from_addr>. Note that this is only used
+ * in case of transparent proxying. Normal source bind addresses are still
+ * determined locally (due to the possible need of a source port).
+ *
+ * It can return one of :
+ *  - SN_ERR_NONE if everything's OK
+ *  - SN_ERR_SRVTO if there are no more servers
+ *  - SN_ERR_SRVCL if the connection was refused by the server
+ *  - SN_ERR_PRXCOND if the connection has been limited by the proxy (maxconn)
+ *  - SN_ERR_RESOURCE if a system resource is lacking (eg: fd limits, ports, ...)
+ *  - SN_ERR_INTERNAL for any other purely internal errors
+ * Additionnally, in the case of SN_ERR_RESOURCE, an emergency log will be emitted.
+ */
+int tcpv4_connect_server(struct stream_interface *si,
+			 struct proxy *be, struct server *srv,
+			 struct sockaddr *srv_addr, struct sockaddr *from_addr)
+{
+	int fd;
+
+	if ((fd = si->fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)) == -1) {
+		qfprintf(stderr, "Cannot get a server socket.\n");
+
+		if (errno == ENFILE)
+			send_log(be, LOG_EMERG,
+				 "Proxy %s reached system FD limit at %d. Please check system tunables.\n",
+				 be->id, maxfd);
+		else if (errno == EMFILE)
+			send_log(be, LOG_EMERG,
+				 "Proxy %s reached process FD limit at %d. Please check 'ulimit-n' and restart.\n",
+				 be->id, maxfd);
+		else if (errno == ENOBUFS || errno == ENOMEM)
+			send_log(be, LOG_EMERG,
+				 "Proxy %s reached system memory limit at %d sockets. Please check system tunables.\n",
+				 be->id, maxfd);
+		/* this is a resource error */
+		return SN_ERR_RESOURCE;
+	}
+
+	if (fd >= global.maxsock) {
+		/* do not log anything there, it's a normal condition when this option
+		 * is used to serialize connections to a server !
+		 */
+		Alert("socket(): not enough free sockets. Raise -n argument. Giving up.\n");
+		close(fd);
+		return SN_ERR_PRXCOND; /* it is a configuration limit */
+	}
+
+	if ((fcntl(fd, F_SETFL, O_NONBLOCK)==-1) ||
+	    (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (char *) &one, sizeof(one)) == -1)) {
+		qfprintf(stderr,"Cannot set client socket to non blocking mode.\n");
+		close(fd);
+		return SN_ERR_INTERNAL;
+	}
+
+	if (be->options & PR_O_TCP_SRV_KA)
+		setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, (char *) &one, sizeof(one));
+
+	if (be->options & PR_O_TCP_NOLING)
+		si->flags |= SI_FL_NOLINGER;
+
+	/* allow specific binding :
+	 * - server-specific at first
+	 * - proxy-specific next
+	 */
+	if (srv != NULL && srv->state & SRV_BIND_SRC) {
+		int ret, flags = 0;
+
+		switch (srv->state & SRV_TPROXY_MASK) {
+		case SRV_TPROXY_ADDR:
+		case SRV_TPROXY_CLI:
+			flags = 3;
+			break;
+		case SRV_TPROXY_CIP:
+		case SRV_TPROXY_DYN:
+			flags = 1;
+			break;
+		}
+
+#ifdef SO_BINDTODEVICE
+		/* Note: this might fail if not CAP_NET_RAW */
+		if (srv->iface_name)
+			setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, srv->iface_name, srv->iface_len + 1);
+#endif
+
+		if (srv->sport_range) {
+			int attempts = 10; /* should be more than enough to find a spare port */
+			struct sockaddr_in src;
+
+			ret = 1;
+			src = srv->source_addr;
+
+			do {
+				/* note: in case of retry, we may have to release a previously
+				 * allocated port, hence this loop's construct.
+				 */
+				port_range_release_port(fdinfo[fd].port_range, fdinfo[fd].local_port);
+				fdinfo[fd].port_range = NULL;
+
+				if (!attempts)
+					break;
+				attempts--;
+
+				fdinfo[fd].local_port = port_range_alloc_port(srv->sport_range);
+				if (!fdinfo[fd].local_port)
+					break;
+
+				fdinfo[fd].port_range = srv->sport_range;
+				src.sin_port = htons(fdinfo[fd].local_port);
+
+				ret = tcpv4_bind_socket(fd, flags, &src, (struct sockaddr_in *)from_addr);
+			} while (ret != 0); /* binding NOK */
+		}
+		else {
+			ret = tcpv4_bind_socket(fd, flags, &srv->source_addr, (struct sockaddr_in *)from_addr);
+		}
+
+		if (ret) {
+			port_range_release_port(fdinfo[fd].port_range, fdinfo[fd].local_port);
+			fdinfo[fd].port_range = NULL;
+			close(fd);
+
+			if (ret == 1) {
+				Alert("Cannot bind to source address before connect() for server %s/%s. Aborting.\n",
+				      be->id, srv->id);
+				send_log(be, LOG_EMERG,
+					 "Cannot bind to source address before connect() for server %s/%s.\n",
+					 be->id, srv->id);
+			} else {
+				Alert("Cannot bind to tproxy source address before connect() for server %s/%s. Aborting.\n",
+				      be->id, srv->id);
+				send_log(be, LOG_EMERG,
+					 "Cannot bind to tproxy source address before connect() for server %s/%s.\n",
+					 be->id, srv->id);
+			}
+			return SN_ERR_RESOURCE;
+		}
+	}
+	else if (be->options & PR_O_BIND_SRC) {
+		int ret, flags = 0;
+
+		switch (be->options & PR_O_TPXY_MASK) {
+		case PR_O_TPXY_ADDR:
+		case PR_O_TPXY_CLI:
+			flags = 3;
+			break;
+		case PR_O_TPXY_CIP:
+		case PR_O_TPXY_DYN:
+			flags = 1;
+			break;
+		}
+
+#ifdef SO_BINDTODEVICE
+		/* Note: this might fail if not CAP_NET_RAW */
+		if (be->iface_name)
+			setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, be->iface_name, be->iface_len + 1);
+#endif
+		ret = tcpv4_bind_socket(fd, flags, &be->source_addr, (struct sockaddr_in *)from_addr);
+		if (ret) {
+			close(fd);
+			if (ret == 1) {
+				Alert("Cannot bind to source address before connect() for proxy %s. Aborting.\n",
+				      be->id);
+				send_log(be, LOG_EMERG,
+					 "Cannot bind to source address before connect() for proxy %s.\n",
+					 be->id);
+			} else {
+				Alert("Cannot bind to tproxy source address before connect() for proxy %s. Aborting.\n",
+				      be->id);
+				send_log(be, LOG_EMERG,
+					 "Cannot bind to tproxy source address before connect() for proxy %s.\n",
+					 be->id);
+			}
+			return SN_ERR_RESOURCE;
+		}
+	}
+
+#if defined(TCP_QUICKACK)
+	/* disabling tcp quick ack now allows the first request to leave the
+	 * machine with the first ACK. We only do this if there are pending
+	 * data in the buffer.
+	 */
+	if ((be->options2 & PR_O2_SMARTCON) && si->ob->send_max)
+                setsockopt(fd, IPPROTO_TCP, TCP_QUICKACK, (char *) &zero, sizeof(zero));
+#endif
+
+	if (global.tune.server_sndbuf)
+                setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &global.tune.server_sndbuf, sizeof(global.tune.server_sndbuf));
+
+	if (global.tune.server_rcvbuf)
+                setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &global.tune.server_rcvbuf, sizeof(global.tune.server_rcvbuf));
+
+	if ((connect(fd, (struct sockaddr *)srv_addr, sizeof(struct sockaddr_in)) == -1) &&
+	    (errno != EINPROGRESS) && (errno != EALREADY) && (errno != EISCONN)) {
+
+		if (errno == EAGAIN || errno == EADDRINUSE) {
+			char *msg;
+			if (errno == EAGAIN) /* no free ports left, try again later */
+				msg = "no free ports";
+			else
+				msg = "local address already in use";
+
+			qfprintf(stderr,"Cannot connect: %s.\n",msg);
+			port_range_release_port(fdinfo[fd].port_range, fdinfo[fd].local_port);
+			fdinfo[fd].port_range = NULL;
+			close(fd);
+			send_log(be, LOG_EMERG,
+				 "Connect() failed for server %s/%s: %s.\n",
+				 be->id, srv->id, msg);
+			return SN_ERR_RESOURCE;
+		} else if (errno == ETIMEDOUT) {
+			//qfprintf(stderr,"Connect(): ETIMEDOUT");
+			port_range_release_port(fdinfo[fd].port_range, fdinfo[fd].local_port);
+			fdinfo[fd].port_range = NULL;
+			close(fd);
+			return SN_ERR_SRVTO;
+		} else {
+			// (errno == ECONNREFUSED || errno == ENETUNREACH || errno == EACCES || errno == EPERM)
+			//qfprintf(stderr,"Connect(): %d", errno);
+			port_range_release_port(fdinfo[fd].port_range, fdinfo[fd].local_port);
+			fdinfo[fd].port_range = NULL;
+			close(fd);
+			return SN_ERR_SRVCL;
+		}
+	}
+
+	fdtab[fd].owner = si;
+	fdtab[fd].state = FD_STCONN; /* connection in progress */
+	fdtab[fd].flags = FD_FL_TCP | FD_FL_TCP_NODELAY;
+	fdtab[fd].cb[DIR_RD].f = &stream_sock_read;
+	fdtab[fd].cb[DIR_RD].b = si->ib;
+	fdtab[fd].cb[DIR_WR].f = &stream_sock_write;
+	fdtab[fd].cb[DIR_WR].b = si->ob;
+
+	fdinfo[fd].peeraddr = (struct sockaddr *)srv_addr;
+	fdinfo[fd].peerlen = sizeof(struct sockaddr_in);
+
+	fd_insert(fd);
+	EV_FD_SET(fd, DIR_WR);  /* for connect status */
+
+	si->state = SI_ST_CON;
+	si->flags |= SI_FL_CAP_SPLTCP; /* TCP supports splicing */
+	si->exp = tick_add_ifset(now_ms, be->timeout.connect);
+
+	return SN_ERR_NONE;  /* connection is OK */
+}
+
+
 /* This function tries to bind a TCPv4/v6 listener. It may return a warning or
  * an error message in <err> if the message is at most <errlen> bytes long
  * (including '\0'). The return value is composed from ERR_ABORT, ERR_WARN,
@@ -210,9 +468,7 @@ int tcp_bind_listener(struct listener *listener, char *errmsg, int errlen)
 		goto tcp_close_return;
 	}
 
-	if ((fcntl(fd, F_SETFL, O_NONBLOCK) == -1) ||
-	    (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY,
-			(char *) &one, sizeof(one)) == -1)) {
+	if (fcntl(fd, F_SETFL, O_NONBLOCK) == -1) {
 		err |= ERR_FATAL | ERR_ALERT;
 		msg = "cannot make socket non-blocking";
 		goto tcp_close_return;
@@ -251,6 +507,25 @@ int tcp_bind_listener(struct listener *listener, char *errmsg, int errlen)
 		}
 	}
 #endif
+#if defined(TCP_MAXSEG)
+	if (listener->maxseg) {
+		if (setsockopt(fd, IPPROTO_TCP, TCP_MAXSEG,
+			       &listener->maxseg, sizeof(listener->maxseg)) == -1) {
+			msg = "cannot set MSS";
+			err |= ERR_WARN;
+		}
+	}
+#endif
+#if defined(TCP_DEFER_ACCEPT)
+	if (listener->options & LI_O_DEF_ACCEPT) {
+		/* defer accept by up to one second */
+		int accept_delay = 1;
+		if (setsockopt(fd, IPPROTO_TCP, TCP_DEFER_ACCEPT, &accept_delay, sizeof(accept_delay)) == -1) {
+			msg = "cannot enable DEFER_ACCEPT";
+			err |= ERR_WARN;
+		}
+	}
+#endif
 	if (bind(fd, (struct sockaddr *)&listener->addr, listener->proto->sock_addrlen) == -1) {
 		err |= ERR_RETRYABLE | ERR_ALERT;
 		msg = "cannot bind socket";
@@ -263,6 +538,11 @@ int tcp_bind_listener(struct listener *listener, char *errmsg, int errlen)
 		goto tcp_close_return;
 	}
 
+#if defined(TCP_QUICKACK)
+	if (listener->options & LI_O_NOQUICKACK)
+		setsockopt(fd, IPPROTO_TCP, TCP_QUICKACK, (char *) &zero, sizeof(zero));
+#endif
+
 	/* the socket is ready */
 	listener->fd = fd;
 	listener->state = LI_LISTEN;
@@ -274,8 +554,12 @@ int tcp_bind_listener(struct listener *listener, char *errmsg, int errlen)
 	fdtab[fd].cb[DIR_RD].b = fdtab[fd].cb[DIR_WR].b = NULL;
 	fdtab[fd].owner = listener; /* reference the listener instead of a task */
 	fdtab[fd].state = FD_STLISTEN;
-	fdtab[fd].peeraddr = NULL;
-	fdtab[fd].peerlen = 0;
+	fdtab[fd].flags = FD_FL_TCP;
+	if (listener->options & LI_O_NOLINGER)
+		fdtab[fd].flags |= FD_FL_TCP_NOLING;
+
+	fdinfo[fd].peeraddr = NULL;
+	fdinfo[fd].peerlen = 0;
  tcp_return:
 	if (msg && errlen)
 		strlcpy2(errmsg, msg, errlen);
@@ -355,7 +639,7 @@ void tcpv6_add_listener(struct listener *listener)
  * called after XXX bytes have been received (or transfered), and the min of
  * all's wishes will be used to ring back (unless a special condition occurs).
  */
-int tcp_inspect_request(struct session *s, struct buffer *req)
+int tcp_inspect_request(struct session *s, struct buffer *req, int an_bit)
 {
 	struct tcp_rule *rule;
 	int partial;
@@ -379,7 +663,7 @@ int tcp_inspect_request(struct session *s, struct buffer *req)
 	 * - if one rule returns KO, then return KO
 	 */
 
-	if (req->flags & BF_SHUTR || !s->fe->tcp_req.inspect_delay || tick_is_expired(req->analyse_exp, now_ms))
+	if (req->flags & (BF_SHUTR|BF_FULL) || !s->fe->tcp_req.inspect_delay || tick_is_expired(req->analyse_exp, now_ms))
 		partial = 0;
 	else
 		partial = ACL_PARTIAL;
@@ -388,9 +672,9 @@ int tcp_inspect_request(struct session *s, struct buffer *req)
 		int ret = ACL_PAT_PASS;
 
 		if (rule->cond) {
-			ret = acl_exec_cond(rule->cond, s->fe, s, NULL, ACL_DIR_REQ | partial);
+			ret = acl_exec_cond(rule->cond, s->fe, s, &s->txn, ACL_DIR_REQ | partial);
 			if (ret == ACL_PAT_MISS) {
-				buffer_write_dis(req);
+				buffer_dont_connect(req);
 				/* just set the request timeout once at the beginning of the request */
 				if (!tick_isset(req->analyse_exp) && s->fe->tcp_req.inspect_delay)
 					req->analyse_exp = tick_add_ifset(now_ms, s->fe->tcp_req.inspect_delay);
@@ -408,7 +692,11 @@ int tcp_inspect_request(struct session *s, struct buffer *req)
 				buffer_abort(req);
 				buffer_abort(s->rep);
 				req->analysers = 0;
-				s->fe->failed_req++;
+
+				s->fe->counters.denied_req++;
+				if (s->listener->counters)
+					s->listener->counters->denied_req++;
+
 				if (!(s->flags & SN_ERR_MASK))
 					s->flags |= SN_ERR_PRXCOND;
 				if (!(s->flags & SN_FINST_MASK))
@@ -423,7 +711,75 @@ int tcp_inspect_request(struct session *s, struct buffer *req)
 	/* if we get there, it means we have no rule which matches, or
 	 * we have an explicit accept, so we apply the default accept.
 	 */
-	req->analysers &= ~AN_REQ_INSPECT;
+	req->analysers &= ~an_bit;
+	req->analyse_exp = TICK_ETERNITY;
+	return 1;
+}
+
+/* Apply RDP cookie persistence to the current session. For this, the function
+ * tries to extract an RDP cookie from the request buffer, and look for the
+ * matching server in the list. If the server is found, it is assigned to the
+ * session. This always returns 1, and the analyser removes itself from the
+ * list. Nothing is performed if a server was already assigned.
+ */
+int tcp_persist_rdp_cookie(struct session *s, struct buffer *req, int an_bit)
+{
+	struct proxy    *px   = s->be;
+	int              ret;
+	struct acl_expr  expr;
+	struct acl_test  test;
+	struct server *srv = px->srv;
+	struct sockaddr_in addr;
+	char *p;
+
+	DPRINTF(stderr,"[%u] %s: session=%p b=%p, exp(r,w)=%u,%u bf=%08x bl=%d analysers=%02x\n",
+		now_ms, __FUNCTION__,
+		s,
+		req,
+		req->rex, req->wex,
+		req->flags,
+		req->l,
+		req->analysers);
+
+	if (s->flags & SN_ASSIGNED)
+		goto no_cookie;
+
+	memset(&expr, 0, sizeof(expr));
+	memset(&test, 0, sizeof(test));
+
+	expr.arg.str = s->be->rdp_cookie_name;
+	expr.arg_len = s->be->rdp_cookie_len;
+
+	ret = acl_fetch_rdp_cookie(px, s, NULL, ACL_DIR_REQ, &expr, &test);
+	if (ret == 0 || (test.flags & ACL_TEST_F_MAY_CHANGE) || test.len == 0)
+		goto no_cookie;
+
+	memset(&addr, 0, sizeof(addr));
+	addr.sin_family = AF_INET;
+
+	/* Considering an rdp cookie detected using acl, test.ptr ended with <cr><lf> and should return */
+	addr.sin_addr.s_addr = strtoul(test.ptr, &p, 10);
+	if (*p != '.')
+		goto no_cookie;
+	p++;
+	addr.sin_port = (unsigned short)strtoul(p, &p, 10);
+	if (*p != '.')
+		goto no_cookie;
+
+	while (srv) {
+		if (memcmp(&addr, &(srv->addr), sizeof(addr)) == 0) {
+			if ((srv->state & SRV_RUNNING) || (px->options & PR_O_PERSIST)) {
+				/* we found the server and it is usable */
+				s->flags |= SN_DIRECT | SN_ASSIGNED;
+				s->srv = srv;
+				break;
+			}
+		}
+		srv = srv->next;
+	}
+
+no_cookie:
+	req->analysers &= ~an_bit;
 	req->analyse_exp = TICK_ETERNITY;
 	return 1;
 }
@@ -441,7 +797,7 @@ static int tcp_parse_tcp_req(char **args, int section_type, struct proxy *curpx,
 
 	if (!*args[1]) {
 		snprintf(err, errlen, "missing argument for '%s' in %s '%s'",
-			 args[0], proxy_type_str(proxy), curpx->id);
+			 args[0], proxy_type_str(curpx), curpx->id);
 		return -1;
 	}
 
@@ -454,7 +810,7 @@ static int tcp_parse_tcp_req(char **args, int section_type, struct proxy *curpx,
 
 		if (!(curpx->cap & PR_CAP_FE)) {
 			snprintf(err, errlen, "%s %s will be ignored because %s '%s' has no %s capability",
-				 args[0], args[1], proxy_type_str(proxy), curpx->id,
+				 args[0], args[1], proxy_type_str(curpx), curpx->id,
 				 "frontend");
 			return 1;
 		}
@@ -462,7 +818,7 @@ static int tcp_parse_tcp_req(char **args, int section_type, struct proxy *curpx,
 		if (!*args[2] || (ptr = parse_time_err(args[2], &val, TIME_UNIT_MS))) {
 			retlen = snprintf(err, errlen,
 					  "'%s %s' expects a positive delay in milliseconds, in %s '%s'",
-					  args[0], args[1], proxy_type_str(proxy), curpx->id);
+					  args[0], args[1], proxy_type_str(curpx), curpx->id);
 			if (ptr && retlen < errlen)
 				retlen += snprintf(err+retlen, errlen - retlen,
 						   " (unexpected character '%c')", *ptr);
@@ -471,7 +827,7 @@ static int tcp_parse_tcp_req(char **args, int section_type, struct proxy *curpx,
 
 		if (curpx->tcp_req.inspect_delay) {
 			snprintf(err, errlen, "ignoring %s %s (was already defined) in %s '%s'",
-				 args[0], args[1], proxy_type_str(proxy), curpx->id);
+				 args[0], args[1], proxy_type_str(curpx), curpx->id);
 			return 1;
 		}
 		curpx->tcp_req.inspect_delay = val;
@@ -505,41 +861,31 @@ static int tcp_parse_tcp_req(char **args, int section_type, struct proxy *curpx,
 		pol = ACL_COND_NONE;
 		cond = NULL;
 
-		if (!*args[3])
-			pol = ACL_COND_NONE;
-		else if (!strcmp(args[3], "if"))
-			pol = ACL_COND_IF;
-		else if (!strcmp(args[3], "unless"))
-			pol = ACL_COND_UNLESS;
-		else {
+		if (strcmp(args[3], "if") == 0 || strcmp(args[3], "unless") == 0) {
+			if ((cond = build_acl_cond(NULL, 0, curpx, (const char **)args+3)) == NULL) {
+				retlen = snprintf(err, errlen,
+						  "error detected in %s '%s' while parsing '%s' condition",
+						  proxy_type_str(curpx), curpx->id, args[3]);
+				return -1;
+			}
+		}
+		else if (*args[3]) {
 			retlen = snprintf(err, errlen,
 					  "'%s %s %s' only accepts 'if' or 'unless', in %s '%s' (was '%s')",
 					  args[0], args[1], args[2], proxy_type_str(curpx), curpx->id, args[3]);
 			return -1;
 		}
 
-		/* Note: we consider "if TRUE" when there is no condition */
-		if (pol != ACL_COND_NONE &&
-		    (cond = parse_acl_cond((const char **)args+4, &curpx->acl, pol)) == NULL) {
-			retlen = snprintf(err, errlen,
-					  "error detected in %s '%s' while parsing '%s' condition",
-					  proxy_type_str(curpx), curpx->id, args[3]);
-			return -1;
-		}
-
-		// FIXME: how to set this ?
-		// cond->line = linenum;
-		if (cond && cond->requires & (ACL_USE_RTR_ANY | ACL_USE_L7_ANY)) {
+		if (cond && (cond->requires & ACL_USE_RTR_ANY)) {
 			struct acl *acl;
 			const char *name;
 
-			acl = cond_find_require(cond, ACL_USE_RTR_ANY|ACL_USE_L7_ANY);
+			acl = cond_find_require(cond, ACL_USE_RTR_ANY);
 			name = acl ? acl->name : "(unknown)";
 
 			retlen = snprintf(err, errlen,
-					  "acl '%s' involves some %s criteria which will be ignored.",
-					  name,
-					  (acl->requires & ACL_USE_RTR_ANY) ? "response-only" : "layer 7");
+					  "acl '%s' involves some response-only criteria which will be ignored.",
+					  name);
 			warn++;
 		}
 		rule = (struct tcp_rule *)calloc(1, sizeof(*rule));
@@ -659,8 +1005,8 @@ acl_fetch_req_ssl_ver(struct proxy *px, struct session *l4, void *l7, int dir,
 	 * all the part of the request which fits in a buffer is already
 	 * there.
 	 */
-	if (msg_len > l4->req->max_len + l4->req->data - l4->req->w)
-		msg_len = l4->req->max_len + l4->req->data - l4->req->w;
+	if (msg_len > buffer_max_len(l4->req) + l4->req->data - l4->req->w)
+		msg_len = buffer_max_len(l4->req) + l4->req->data - l4->req->w;
 
 	if (bleft < msg_len)
 		goto too_short;
@@ -678,6 +1024,112 @@ acl_fetch_req_ssl_ver(struct proxy *px, struct session *l4, void *l7, int dir,
 	return 0;
 }
 
+int
+acl_fetch_rdp_cookie(struct proxy *px, struct session *l4, void *l7, int dir,
+                     struct acl_expr *expr, struct acl_test *test)
+{
+	int bleft;
+	const unsigned char *data;
+
+	if (!l4 || !l4->req)
+		return 0;
+
+	test->flags = 0;
+
+	bleft = l4->req->l;
+	if (bleft <= 11)
+		goto too_short;
+
+	data = (const unsigned char *)l4->req->w + 11;
+	bleft -= 11;
+
+	if (bleft <= 7)
+		goto too_short;
+
+	if (strncasecmp((const char *)data, "Cookie:", 7) != 0)
+		goto not_cookie;
+
+	data += 7;
+	bleft -= 7;
+
+	while (bleft > 0 && *data == ' ') {
+		data++;
+		bleft--;
+	}
+
+	if (expr->arg_len) {
+
+		if (bleft <= expr->arg_len)
+			goto too_short;
+
+		if ((data[expr->arg_len] != '=') ||
+		    strncasecmp(expr->arg.str, (const char *)data, expr->arg_len) != 0)
+			goto not_cookie;
+
+		data += expr->arg_len + 1;
+		bleft -= expr->arg_len + 1;
+	} else {
+		while (bleft > 0 && *data != '=') {
+			if (*data == '\r' || *data == '\n')
+				goto not_cookie;
+			data++;
+			bleft--;
+		}
+
+		if (bleft < 1)
+			goto too_short;
+
+		if (*data != '=')
+			goto not_cookie;
+
+		data++;
+		bleft--;
+	}
+
+	/* data points to cookie value */
+	test->ptr = (char *)data;
+	test->len = 0;
+
+	while (bleft > 0 && *data != '\r') {
+		data++;
+		bleft--;
+	}
+
+	if (bleft < 2)
+		goto too_short;
+
+	if (data[0] != '\r' || data[1] != '\n')
+		goto not_cookie;
+
+	test->len = (char *)data - test->ptr;
+	test->flags = ACL_TEST_F_VOLATILE;
+	return 1;
+
+ too_short:
+	test->flags = ACL_TEST_F_MAY_CHANGE;
+ not_cookie:
+	return 0;
+}
+
+static int
+acl_fetch_rdp_cookie_cnt(struct proxy *px, struct session *l4, void *l7, int dir,
+			struct acl_expr *expr, struct acl_test *test)
+{
+	int ret;
+
+	ret = acl_fetch_rdp_cookie(px, l4, l7, dir, expr, test);
+
+	test->ptr = NULL;
+	test->len = 0;
+
+	if (test->flags & ACL_TEST_F_MAY_CHANGE)
+		return 0;
+
+	test->flags = ACL_TEST_F_VOLATILE;
+	test->i = ret;
+
+	return 1;
+}
 
 static struct cfg_kw_list cfg_kws = {{ },{
 	{ CFG_LISTEN, "tcp-request", tcp_parse_tcp_req },
@@ -687,6 +1139,8 @@ static struct cfg_kw_list cfg_kws = {{ },{
 static struct acl_kw_list acl_kws = {{ },{
 	{ "req_len",      acl_parse_int,        acl_fetch_req_len,     acl_match_int, ACL_USE_L4REQ_VOLATILE },
 	{ "req_ssl_ver",  acl_parse_dotted_ver, acl_fetch_req_ssl_ver, acl_match_int, ACL_USE_L4REQ_VOLATILE },
+	{ "req_rdp_cookie",     acl_parse_str,  acl_fetch_rdp_cookie,     acl_match_str, ACL_USE_L4REQ_VOLATILE|ACL_MAY_LOOKUP },
+	{ "req_rdp_cookie_cnt", acl_parse_int,  acl_fetch_rdp_cookie_cnt, acl_match_int, ACL_USE_L4REQ_VOLATILE },
 	{ NULL, NULL, NULL, NULL },
 }};
 

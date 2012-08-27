@@ -1,7 +1,7 @@
 /*
  * Queue management functions.
  *
- * Copyright 2000-2008 Willy Tarreau <w@1wt.eu>
+ * Copyright 2000-2009 Willy Tarreau <w@1wt.eu>
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License
@@ -86,7 +86,8 @@ void process_srv_queue(struct server *s)
  * returned. Note that neither <srv> nor <px> may be NULL.
  * Priority is given to the oldest request in the queue if both <srv> and <px>
  * have pending requests. This ensures that no request will be left unserved.
- * The <px> queue is not considered if the server is not RUNNING. The <srv>
+ * The <px> queue is not considered if the server (or a tracked server) is not
+ * RUNNING, is disabled, or has a null weight (server going down). The <srv>
  * queue is still considered in this case, because if some connections remain
  * there, it means that some requests have been forced there after it was seen
  * down (eg: due to option persist).
@@ -97,11 +98,16 @@ struct session *pendconn_get_next_sess(struct server *srv, struct proxy *px)
 {
 	struct pendconn *ps, *pp;
 	struct session *sess;
+	struct server *rsrv;
+
+	rsrv = srv->tracked;
+	if (!rsrv)
+		rsrv = srv;
 
 	ps = pendconn_from_srv(srv);
 	pp = pendconn_from_px(px);
 	/* we want to get the definitive pendconn in <ps> */
-	if (!pp || !(srv->state & SRV_RUNNING)) {
+	if (!pp || !srv_is_usable(rsrv->state, rsrv->eweight)) {
 		if (!ps)
 			return NULL;
 	} else {
@@ -147,14 +153,14 @@ struct pendconn *pendconn_add(struct session *sess)
 		LIST_ADDQ(&sess->srv->pendconns, &p->list);
 		sess->srv->nbpend++;
 		sess->logs.srv_queue_size += sess->srv->nbpend;
-		if (sess->srv->nbpend > sess->srv->nbpend_max)
-			sess->srv->nbpend_max = sess->srv->nbpend;
+		if (sess->srv->nbpend > sess->srv->counters.nbpend_max)
+			sess->srv->counters.nbpend_max = sess->srv->nbpend;
 	} else {
 		LIST_ADDQ(&sess->be->pendconns, &p->list);
 		sess->be->nbpend++;
 		sess->logs.prx_queue_size += sess->be->nbpend;
-		if (sess->be->nbpend > sess->be->nbpend_max)
-			sess->be->nbpend_max = sess->be->nbpend;
+		if (sess->be->nbpend > sess->be->counters.nbpend_max)
+			sess->be->counters.nbpend_max = sess->be->nbpend;
 	}
 	sess->be->totpend++;
 	return p;

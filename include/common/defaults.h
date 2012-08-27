@@ -1,23 +1,23 @@
 /*
-  include/common/defaults.h
-  Miscellaneous default values.
-
-  Copyright (C) 2000-2008 Willy Tarreau - w@1wt.eu
-
-  This library is free software; you can redistribute it and/or
-  modify it under the terms of the GNU Lesser General Public
-  License as published by the Free Software Foundation, version 2.1
-  exclusively.
-
-  This library is distributed in the hope that it will be useful,
-  but WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public
-  License along with this library; if not, write to the Free Software
-  Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
-*/
+ * include/common/defaults.h
+ * Miscellaneous default values.
+ *
+ * Copyright (C) 2000-2010 Willy Tarreau - w@1wt.eu
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation, version 2.1
+ * exclusively.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
+ */
 
 #ifndef _COMMON_DEFAULTS_H
 #define _COMMON_DEFAULTS_H
@@ -40,16 +40,6 @@
 #define MAXREWRITE      (BUFSIZE / 2)
 #endif
 
-/* FORWARD_DEFAULT_SIZE
- * Indicates how many bytes may be forwarded at once in low-level stream-socks
- * without waking the owner task up. This should be much larger than the buffer
- * size. A few megabytes seem appropriate.
- */
-#ifndef FORWARD_DEFAULT_SIZE
-#define FORWARD_DEFAULT_SIZE (16*1024*1024)
-#endif
-
-
 #define REQURI_LEN      1024
 #define CAPTURE_LEN     64
 
@@ -58,17 +48,11 @@
 #define LINESIZE	2048
 #endif
 
-// max # of configuration files
-#define MAX_CFG_FILES   10
-
 // max # args on a configuration line
 #define MAX_LINE_ARGS   64
 
-// max # args on a uxts socket
-#define MAX_UXST_ARGS   16
-
-// max # of added headers per request
-#define MAX_NEWHDR      10
+// max # args on a stats socket
+#define MAX_STATS_ARGS  16
 
 // max # of matches per regexp
 #define	MAX_MATCH       10
@@ -77,6 +61,11 @@
 // By default, about 100 headers per 8 kB.
 #ifndef MAX_HTTP_HDR
 #define MAX_HTTP_HDR    ((BUFSIZE+79)/80)
+#endif
+
+// max # of headers in history when looking for header #-X
+#ifndef MAX_HDR_HISTORY
+#define MAX_HDR_HISTORY 10
 #endif
 
 // max # of loops we can perform around a read() which succeeds.
@@ -108,6 +97,12 @@
 #define MIN_RET_FOR_READ_LOOP 1460
 #endif
 
+// The minimum number of bytes to be forwarded that is worth trying to splice.
+// Below 4kB, it's not worth allocating pipes nor pretending to zero-copy.
+#ifndef MIN_SPLICE_FORWARD
+#define MIN_SPLICE_FORWARD 4096
+#endif
+
 // the max number of events returned in one call to poll/epoll. Too small a
 // value will cause lots of calls, and too high a value may cause high latency.
 #ifndef MAX_POLL_EVENTS
@@ -121,14 +116,24 @@
 #define COOKIE_DELIM    '~'
 #endif
 
+// this delimitor is used between a server's name and a last visit date in
+// cookies exchanged with the client.
+#ifndef COOKIE_DELIM_DATE
+#define COOKIE_DELIM_DATE       '|'
+#endif
+
 #define CONN_RETRIES    3
 
 #define	CHK_CONNTIME    2000
 #define	DEF_CHKINTR     2000
 #define DEF_FALLTIME    3
 #define DEF_RISETIME    2
-#define DEF_CHECK_REQ   "OPTIONS / HTTP/1.0\r\n\r\n"
+#define DEF_CHECK_REQ   "OPTIONS / HTTP/1.0\r\n"
 #define DEF_SMTP_CHECK_REQ   "HELO localhost\r\n"
+#define DEF_LDAP_CHECK_REQ   "\x30\x0c\x02\x01\x01\x60\x07\x02\x01\x03\x04\x00\x80\x00"
+
+#define DEF_HANA_ONERR		HANA_ONERR_FAILCHK
+#define DEF_HANA_ERRLIMIT	10
 
 // X-Forwarded-For header default
 #define DEF_XFORWARDFOR_HDR	"X-Forwarded-For"
@@ -182,6 +187,11 @@
 /* Maximum host name length */
 #ifndef MAX_HOSTNAME_LEN
 #define MAX_HOSTNAME_LEN	32
+#endif
+
+/* Maximum health check description length */
+#ifndef HCHK_DESC_LEN
+#define HCHK_DESC_LEN	128
 #endif
 
 #endif /* _COMMON_DEFAULTS_H */

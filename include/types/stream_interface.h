@@ -1,28 +1,29 @@
 /*
-  include/types/stream_interface.h
-  This file describes the stream_interface struct and associated constants.
-
-  Copyright (C) 2000-2008 Willy Tarreau - w@1wt.eu
-
-  This library is free software; you can redistribute it and/or
-  modify it under the terms of the GNU Lesser General Public
-  License as published by the Free Software Foundation, version 2.1
-  exclusively.
-
-  This library is distributed in the hope that it will be useful,
-  but WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public
-  License along with this library; if not, write to the Free Software
-  Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
-*/
+ * include/types/stream_interface.h
+ * This file describes the stream_interface struct and associated constants.
+ *
+ * Copyright (C) 2000-2009 Willy Tarreau - w@1wt.eu
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation, version 2.1
+ * exclusively.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
+ */
 
 #ifndef _TYPES_STREAM_INTERFACE_H
 #define _TYPES_STREAM_INTERFACE_H
 
 #include <stdlib.h>
+#include <sys/socket.h>
 
 #include <types/buffers.h>
 #include <common/config.h>
@@ -67,24 +68,41 @@ enum {
 	SI_FL_ERR        = 0x0002,  /* a non-recoverable error has occurred */
 	SI_FL_WAIT_ROOM  = 0x0004,  /* waiting for space to store incoming data */
 	SI_FL_WAIT_DATA  = 0x0008,  /* waiting for more data to send */
-	/* 0x10..0x20 already used in 1.4 */
+	SI_FL_CAP_SPLTCP = 0x0010,  /* splicing possible from/to TCP */
+	SI_FL_DONT_WAKE  = 0x0020,  /* resync in progress, don't wake up */
 	SI_FL_INDEP_STR  = 0x0040,  /* independant streams = don't update rex on write */
+	SI_FL_NOLINGER   = 0x0080,  /* may close without lingering. One-shot. */
 };
 
+#define SI_FL_CAP_SPLICE (SI_FL_CAP_SPLTCP)
+
+struct server;
+struct proxy;
+
+/* Note that if an iohandler is set, the update function will not be called by
+ * the session handler, so it may be used to resync flags at the end of the I/O
+ * handler. See stream_int_update_embedded() for reference.
+ */
 struct stream_interface {
 	unsigned int state;     /* SI_ST* */
 	unsigned int prev_state;/* SI_ST*, copy of previous state */
 	void *owner;            /* generally a (struct task*) */
 	int fd;                 /* file descriptor for a stream driver when known */
-	unsigned int flags;     /* SI_FL_*, must be cleared before I/O */
+	unsigned int flags;
 	unsigned int exp;       /* wake up time for connect, queue, turn-around, ... */
+	void (*update)(struct stream_interface *); /* I/O update function */
 	void (*shutr)(struct stream_interface *);  /* shutr function */
 	void (*shutw)(struct stream_interface *);  /* shutw function */
 	void (*chk_rcv)(struct stream_interface *);/* chk_rcv function */
 	void (*chk_snd)(struct stream_interface *);/* chk_snd function */
+	int (*connect)(struct stream_interface *, struct proxy *, struct server *,
+		       struct sockaddr *, struct sockaddr *); /* connect function if any */
+	void (*iohandler)(struct stream_interface *);  /* internal I/O handler when embedded */
 	struct buffer *ib, *ob; /* input and output buffers */
 	unsigned int err_type;  /* first error detected, one of SI_ET_* */
 	void *err_loc;          /* commonly the server, NULL when SI_ET_NONE */
+	void *private;          /* may be used by any function above */
+	unsigned int st0, st1;  /* may be used by any function above */
 };
 
 

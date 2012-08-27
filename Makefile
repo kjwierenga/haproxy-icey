@@ -17,10 +17,11 @@
 #   USE_REGPARM          : enable regparm optimization. Recommended on x86.
 #   USE_SEPOLL           : enable speculative epoll(). Automatic.
 #   USE_STATIC_PCRE      : enable static libpcre. Recommended.
-#   USE_TCPSPLICE        : enable tcp_splice() on Linux (needs kernel patch).
 #   USE_TPROXY           : enable transparent proxy. Automatic.
-#   USE_LINUX_TPROXY     : enable full transparent proxy (need kernel patch).
+#   USE_LINUX_TPROXY     : enable full transparent proxy (needs kernel 2.6.28).
 #   USE_LINUX_SPLICE     : enable kernel 2.6 splicing (broken on old kernels)
+#   USE_LIBCRYPT         : enable crypted passwords using -lcrypt
+#   USE_CRYPT_H          : set it if your system requires including crypt.h
 #
 # Options can be forced by specifying "USE_xxx=1" or can be disabled by using
 # "USE_xxx=" (empty string).
@@ -76,14 +77,14 @@ TARGET =
 #### TARGET CPU
 # Use CPU=<cpu_name> to optimize for a particular CPU, among the following
 # list :
-#    generic, i586, i686, ultrasparc, custom
+#    generic, native, i586, i686, ultrasparc, custom
 CPU = generic
 
 #### Architecture, used when not building for native architecture
 # Use ARCH=<arch_name> to force build for a specific architecture. Known
 # architectures will lead to "-m32" or "-m64" being added to CFLAGS and
 # LDFLAGS. This can be required to build 32-bit binaries on 64-bit targets.
-# Currently, only x86_64, i386, i486, i586 and i686 are understood.
+# Currently, only 32, 64, x86_64, i386, i486, i586 and i686 are understood.
 ARCH =
 
 #### Toolchain options.
@@ -94,6 +95,11 @@ LD = $(CC)
 #### Debug flags (typically "-g").
 # Those flags only feed CFLAGS so it is not mandatory to use this form.
 DEBUG_CFLAGS = -g
+
+#### Compiler-specific flags that may be used to disable some negative over-
+# optimization or to silence some warnings. -fno-strict-aliasing is needed with
+# gcc >= 4.4.
+SPEC_CFLAGS = -fno-strict-aliasing
 
 #### Memory usage tuning
 # If small memory footprint is required, you can reduce the buffer size. There
@@ -109,7 +115,8 @@ SMALL_OPTS =
 #### Debug settings
 # You can enable debugging on specific code parts by setting DEBUG=-DDEBUG_xxx.
 # Currently defined DEBUG macros include DEBUG_FULL, DEBUG_MEMORY, DEBUG_FSM,
-# and DEBUG_HASH. Please check sources for exact meaning or do not use at all.
+# DEBUG_HASH and DEBUG_AUTH. Please check sources for exact meaning or do not
+# use at all.
 DEBUG =
 
 #### Additional include and library dirs
@@ -131,12 +138,15 @@ SILENT_DEFINE =
 # them. You should not have to change these options. Better use CPU_CFLAGS or
 # even CFLAGS instead.
 CPU_CFLAGS.generic    = -O2
+CPU_CFLAGS.native     = -O2 -march=native
 CPU_CFLAGS.i586       = -O2 -march=i586
 CPU_CFLAGS.i686       = -O2 -march=i686
 CPU_CFLAGS.ultrasparc = -O6 -mcpu=v9 -mtune=ultrasparc
 CPU_CFLAGS            = $(CPU_CFLAGS.$(CPU))
 
 #### ARCH dependant flags, may be overriden by CPU flags
+ARCH_FLAGS.32     = -m32
+ARCH_FLAGS.64     = -m64
 ARCH_FLAGS.i386   = -m32 -march=i386
 ARCH_FLAGS.i486   = -m32 -march=i486
 ARCH_FLAGS.i586   = -m32 -march=i586
@@ -148,7 +158,7 @@ ARCH_FLAGS        = $(ARCH_FLAGS.$(ARCH))
 # These CFLAGS contain general optimization options, CPU-specific optimizations
 # and debug flags. They may be overridden by some distributions which prefer to
 # set all of them at once instead of playing with the CPU and DEBUG variables.
-CFLAGS = $(ARCH_FLAGS) $(CPU_CFLAGS) $(DEBUG_CFLAGS)
+CFLAGS = $(ARCH_FLAGS) $(CPU_CFLAGS) $(DEBUG_CFLAGS) $(SPEC_CFLAGS)
 
 #### Common LDFLAGS
 # These LDFLAGS are used as the first "ld" options, regardless of any library
@@ -171,6 +181,7 @@ ifeq ($(TARGET),linux22)
   USE_GETSOCKNAME = implicit
   USE_POLL        = implicit
   USE_TPROXY      = implicit
+  USE_LIBCRYPT    = implicit
 else
 ifeq ($(TARGET),linux24)
   # This is for standard Linux 2.4 with netfilter but without epoll()
@@ -178,6 +189,7 @@ ifeq ($(TARGET),linux24)
   USE_NETFILTER   = implicit
   USE_POLL        = implicit
   USE_TPROXY      = implicit
+  USE_LIBCRYPT    = implicit
 else
 ifeq ($(TARGET),linux24e)
   # This is for enhanced Linux 2.4 with netfilter and epoll() patch > 0.21
@@ -188,6 +200,7 @@ ifeq ($(TARGET),linux24e)
   USE_SEPOLL      = implicit
   USE_MY_EPOLL    = implicit
   USE_TPROXY      = implicit
+  USE_LIBCRYPT    = implicit
 else
 ifeq ($(TARGET),linux26)
   # This is for standard Linux 2.6 with netfilter and standard epoll()
@@ -197,6 +210,7 @@ ifeq ($(TARGET),linux26)
   USE_EPOLL       = implicit
   USE_SEPOLL      = implicit
   USE_TPROXY      = implicit
+  USE_LIBCRYPT    = implicit
 else
 ifeq ($(TARGET),solaris)
   # This is for Solaris 8
@@ -204,12 +218,15 @@ ifeq ($(TARGET),solaris)
   TARGET_CFLAGS  = -fomit-frame-pointer -DFD_SETSIZE=65536 -D_REENTRANT
   TARGET_LDFLAGS = -lnsl -lsocket
   USE_TPROXY     = implicit
+  USE_LIBCRYPT    = implicit
+  USE_CRYPT_H     = implicit
 else
 ifeq ($(TARGET),freebsd)
   # This is for FreeBSD
   USE_POLL       = implicit
   USE_KQUEUE     = implicit
   USE_TPROXY     = implicit
+  USE_LIBCRYPT   = implicit
 else
 ifeq ($(TARGET),openbsd)
   # This is for OpenBSD >= 3.0
@@ -301,11 +318,7 @@ BUILD_OPTIONS =
 ignore_implicit = $(patsubst %=implicit,,$(1)=$($(1)))
 
 ifneq ($(USE_TCPSPLICE),)
-# This is the directory hosting libtcpsplice.[ah]
-TCPSPLICEDIR    :=
-OPTIONS_CFLAGS  += -DCONFIG_HAP_TCPSPLICE -I$(TCPSPLICEDIR)
-OPTIONS_LDFLAGS += -L$(TCPSPLICEDIR) -ltcpsplice
-BUILD_OPTIONS   += $(call ignore_implicit,USE_TCPSPLICE)
+$(error experimental option USE_TCPSPLICE has been removed, check USE_LINUX_SPLICE)
 endif
 
 ifneq ($(USE_LINUX_SPLICE),)
@@ -327,6 +340,17 @@ endif
 ifneq ($(USE_LINUX_TPROXY),)
 OPTIONS_CFLAGS += -DCONFIG_HAP_LINUX_TPROXY
 BUILD_OPTIONS  += $(call ignore_implicit,USE_LINUX_TPROXY)
+endif
+
+ifneq ($(USE_LIBCRYPT),)
+OPTIONS_CFLAGS  += -DCONFIG_HAP_CRYPT
+BUILD_OPTIONS   += $(call ignore_implicit,USE_LIBCRYPT)
+OPTIONS_LDFLAGS += -lcrypt
+endif
+
+ifneq ($(USE_CRYPT_H),)
+OPTIONS_CFLAGS  += -DNEED_CRYPT_H
+BUILD_OPTIONS   += $(call ignore_implicit,USE_CRYPT_H)
 endif
 
 ifneq ($(USE_POLL),)
@@ -369,7 +393,7 @@ BUILD_OPTIONS  += $(call ignore_implicit,USE_GETSOCKNAME)
 endif
 
 ifneq ($(USE_REGPARM),)
-OPTIONS_CFLAGS += -DCONFIG_HAP_USE_REGPARM
+OPTIONS_CFLAGS += -DCONFIG_REGPARM=3
 BUILD_OPTIONS  += $(call ignore_implicit,USE_REGPARM)
 endif
 
@@ -393,13 +417,14 @@ endif
 
 ifneq ($(USE_PCRE),)
 # PCREDIR is the directory hosting include/pcre.h and lib/libpcre.*. It is
-# automatically detected but can be forced if required.
+# automatically detected but can be forced if required. Forcing it to an empty
+# string will result in search only in the default paths.
 ifeq ($(PCREDIR),)
 PCREDIR	        := $(shell pcre-config --prefix 2>/dev/null || echo /usr/local)
 endif
 ifeq ($(USE_STATIC_PCRE),)
-OPTIONS_CFLAGS  += -DUSE_PCRE -I$(PCREDIR)/include
-OPTIONS_LDFLAGS += -L$(PCREDIR)/lib -lpcreposix -lpcre
+OPTIONS_CFLAGS  += -DUSE_PCRE $(if $(PCREDIR),-I$(PCREDIR)/include)
+OPTIONS_LDFLAGS += $(if $(PCREDIR),-L$(PCREDIR)/lib) -lpcreposix -lpcre
 endif
 BUILD_OPTIONS   += $(call ignore_implicit,USE_PCRE)
 endif
@@ -410,15 +435,17 @@ ifneq ($(USE_STATIC_PCRE),)
 ifeq ($(PCREDIR),)
 PCREDIR         := $(shell pcre-config --prefix 2>/dev/null || echo /usr/local)
 endif
-OPTIONS_CFLAGS  += -DUSE_PCRE -I$(PCREDIR)/include
-OPTIONS_LDFLAGS += -L$(PCREDIR)/lib -Wl,-Bstatic -lpcreposix -lpcre -Wl,-Bdynamic
+OPTIONS_CFLAGS  += -DUSE_PCRE $(if $(PCREDIR),-I$(PCREDIR)/include)
+OPTIONS_LDFLAGS += $(if $(PCREDIR),-L$(PCREDIR)/lib) -Wl,-Bstatic -lpcreposix -lpcre -Wl,-Bdynamic
 BUILD_OPTIONS   += $(call ignore_implicit,USE_STATIC_PCRE)
 endif
 
+# This one can be changed to look for ebtree files in an external directory
+EBTREE_DIR := ebtree
 
 #### Global compile options
 VERBOSE_CFLAGS = $(CFLAGS) $(TARGET_CFLAGS) $(SMALL_OPTS) $(DEFINE)
-COPTS  = -Iinclude -Wall
+COPTS  = -Iinclude -I$(EBTREE_DIR) -Wall
 COPTS += $(CFLAGS) $(TARGET_CFLAGS) $(SMALL_OPTS) $(DEFINE) $(SILENT_DEFINE)
 COPTS += $(DEBUG) $(OPTIONS_CFLAGS) $(ADDINC)
 
@@ -462,15 +489,26 @@ endif
 OBJS = src/haproxy.o src/sessionhash.o src/base64.o src/protocols.o \
        src/uri_auth.o src/standard.o src/buffers.o src/log.o src/task.o \
        src/time.o src/fd.o src/pipe.o src/regex.o src/cfgparse.o src/server.o \
-       src/checks.o src/queue.o src/client.o src/proxy.o src/proto_uxst.o \
+       src/checks.o src/queue.o src/client.o src/proxy.o src/stick_table.o src/proto_uxst.o \
        src/proto_http.o src/stream_sock.o src/appsession.o src/backend.o \
+       src/lb_chash.o src/lb_fwlc.o src/lb_fwrr.o src/lb_map.o \
        src/stream_interface.o src/dumpstats.o src/proto_tcp.o \
        src/session.o src/hdr_idx.o src/ev_select.o src/signal.o \
-       src/acl.o src/memory.o src/freq_ctr.o \
-       src/ebtree.o src/eb32tree.o
+       src/acl.o src/pattern.o src/memory.o src/freq_ctr.o src/auth.o
 
-haproxy: $(OBJS) $(OPTIONS_OBJS)
+EBTREE_OBJS = $(EBTREE_DIR)/ebtree.o \
+              $(EBTREE_DIR)/eb32tree.o $(EBTREE_DIR)/eb64tree.o \
+              $(EBTREE_DIR)/ebmbtree.o $(EBTREE_DIR)/ebsttree.o \
+              $(EBTREE_DIR)/ebimtree.o $(EBTREE_DIR)/ebistree.o
+
+# Not used right now
+LIB_EBTREE = $(EBTREE_DIR)/libebtree.a
+
+haproxy: $(OBJS) $(OPTIONS_OBJS) $(EBTREE_OBJS)
 	$(LD) $(LDFLAGS) -o $@ $^ $(LDOPTS)
+
+$(LIB_EBTREE): $(EBTREE_OBJS)
+	$(AR) rv $@ $^
 
 objsize: haproxy
 	@objdump -t $^|grep ' g '|grep -F '.text'|awk '{print $$5 FS $$6}'|sort
@@ -508,13 +546,13 @@ install-bin: haproxy
 install: install-bin install-man install-doc
 
 clean:
-	rm -f *.[oas] src/*.[oas] core haproxy test
-	for dir in . src include/* doc; do rm -f $$dir/*~ $$dir/*.rej;done
+	rm -f *.[oas] src/*.[oas] ebtree/*.[oas] haproxy test
+	for dir in . src include/* doc ebtree; do rm -f $$dir/*~ $$dir/*.rej $$dir/core; done
 	rm -f haproxy-$(VERSION).tar.gz haproxy-$(VERSION)$(SUBVERS).tar.gz
 	rm -f haproxy-$(VERSION) nohup.out gmon.out
 
 tags:
-	find src include -name '*.c' -o -name '*.h' -print0 | \
+	find src include \( -name '*.c' -o -name '*.h' \) -print0 | \
 	   xargs -0 etags --declarations --members
 
 tar:	clean

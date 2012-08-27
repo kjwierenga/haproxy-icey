@@ -1,6 +1,7 @@
 /*
  * Elastic Binary Trees - exported generic functions
- * (C) 2002-2007 - Willy Tarreau <w@1wt.eu>
+ * Version 6.0
+ * (C) 2002-2010 - Willy Tarreau <w@1wt.eu>
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -17,7 +18,7 @@
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
  */
 
-#include <common/ebtree.h>
+#include "ebtree.h"
 
 void eb_delete(struct eb_node *node)
 {

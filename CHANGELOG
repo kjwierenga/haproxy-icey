@@ -1,53 +1,793 @@
 ChangeLog :
 ===========
 
-2009/10/14 : 1.3.22
-    - [BUG] unix socket: don't try to dereference frontend/backends
+2012/05/21 : 1.4.21
+    - MINOR: patch for minor typo (ressources/resources)
+    - CLEANUP: fix typo in findserver() log message
+    - DOC: cleanup indentation, alignment, columns and chapters
+    - DOC: fix some keywords arguments documentation
+    - MINOR: stats admin: allow unordered parameters in POST requests
+    - MINOR: stats admin: use the backend id instead of its name in the form
+    - BUG/MAJOR: trash must always be the size of a buffer
+    - DOC: fix minor regex example issue and improve doc on stats
+    - BUG/MAJOR: possible crash when using capture headers on TCP frontends
+    - MINOR: config: disable header captures in TCP mode and complain
+    - BUG/MEDIUM: balance source did not properly hash IPv6 addresses
+    - CLEANUP: http: message parser must ignore HTTP_MSG_ERROR
+    - CLEANUP: remove a few warning about unchecked return values in debug code
+    - CLEANUP: http: remove unused http_msg->col
+    - BUG/MINOR: http: error snapshots are wrong if buffer wraps
+    - BUG/MAJOR: checks: don't call set_server_status_* when no LB algo is set
+    - MINOR: proxy: make findproxy() return proxies from numeric IDs too
+    - BUILD: http: stop gcc-4.1.2 from complaining about possibly uninitialized values
+    - BUG/MINOR: stop connect timeout when connect succeeds
+
+2012/03/10 : 1.4.20
+    - BUG/MINOR: fix typo in processing of http-send-name-header
+    - BUG/MEDIUM: correctly disable servers tracking another disabled servers.
+    - BUG/MEDIUM: zero-weight servers must not dequeue requests from the backend
+    - MINOR: halog: add some help on the command line     (cherry picked from commit 615674cdec067066a42f53f5d55628ab7b207e6c)
+    - BUILD: fix build error on FreeBSD
+    - BUG: queue: fix dequeueing sequence on HTTP keep-alive sessions
+    - BUG: http: disable TCP delayed ACKs when forwarding content-length data
+    - BUG: checks: fix server maintenance exit sequence
+    - BUG/MINOR: stream_sock: don't remove BF_EXPECT_MORE and BF_SEND_DONTWAIT on partial writes
+    - DOC: enumerate valid status codes for "observe layer7"
+    - BUILD: make it possible to look for pcre in the default system paths
+
+2012/01/08 : 1.4.19
+    - MEDIUM: http: add support for sending the server's name in the outgoing request
+    - BUG/MINOR: fix options forwardfor if-none when an alternative header name is specified
+    - MINOR: task: new function task_schedule() to schedule a wake up
+    - BUG/MEDIUM: checks: fix slowstart behaviour when server tracking is in use
+    - BUG: tcp: option nolinger does not work on backends
+    - BUG: ebtree: ebst_lookup() could return the wrong entry
+    - BUG: http: re-enable TCP quick-ack upon incomplete HTTP requests
+    - CLEANUP: ebtree: remove a few annoying signedness warnings
+    - CLEANUP: ebtree: remove 4-year old harmless typo in duplicates insertion code
+    - CLEANUP: ebtree: remove another typo, a wrong initialization in insertion code
+    - BUG: proto_tcp: set AF_INET on tproxy for use with recent kernels
+    - MINOR: halog: add support for matching queued requests
+    - BUG: http: tighten the list of allowed characters in a URI
+
+2011/09/16 : 1.4.18
+    - [MINOR] http: *_dom matching header functions now also split on ":"
+    - [MINOR] halog: support backslash-escaped quotes
+    - BUILD/MINOR: fix the source URL in the spec file
+    - DOC: acl is http_first_req, not http_req_first
+    - BUG/MEDIUM: don't trim last spaces from headers consisting only of spaces
+    - MINOR: acl: add new matches for header/path/url length
+    - [MINOR] halog: do not consider byte 0x8A as end of line
+    - [OPTIM] halog: make fgets parse more bytes by blocks
+    - [OPTIM] halog: add assembly version of the field lookup code
+    - [CLEANUP] startup: report only the basename in the usage message
+    - [DOC] update the README file to reflect new naming rules for patches
+    - BUILD: halog: make halog build on solaris
+
+2011/09/05 : 1.4.17
+    - [MINOR] halog: add support for termination code matching (-tcn/-TCN)
+    - [MINOR] halog: make SKIP_CHAR stop on field delimiters
+    - [MINOR] halog: add support for HTTP log matching (-H)
+    - [MINOR] halog: gain back performance before SKIP_CHAR fix
+    - [OPTIM] halog: cache some common fields positions
+    - [OPTIM] halog: check once for correct line format and reuse the pointer
+    - [OPTIM] halog: remove many 'if' by using a function pointer for the filters
+    - [OPTIM] halog: remove support for tab delimiters in input data
+    - [MINOR] halog: add -hs/-HS to filter by HTTP status code range
+    - [CLEANUP] update the year in the copyright banner
+    - [BUG] check: http-check expect + regex would crash in defaults section
+    - [MEDIUM] http: make x-forwarded-for addition conditional
+    - [DOC] fixed a few "sensible" -> "sensitive" errors
+    - [MINOR] stats: display "<NONE>" instead of the frontend name when unknown
+    - [BUG] http: trailing white spaces must also be trimmed after headers
+    - [MINOR] http: take a capture of too large requests and responses
+    - [MINOR] http: take a capture of truncated responses
+    - [MINOR] http: take a capture of bad content-lengths.
+
+2011/08/04 : 1.4.16
+    - [BUG] checks: fix support of Mysqld >= 5.5 for mysql-check
+    - [DOC] Minor spelling fixes and grammatical enhancements
+    - [CLEANUP] Remove assigned but unused variables
+    - [BUG] checks: http-check expect could fail a check on multi-packet responses
+    - [DOC] fix minor typo in the "dispatch" doc
+    - [MINOR] http: make the "HTTP 200" status code configurable.
+    - [MINOR] http: partially revert the chunking optimization for now
+    - [MINOR] stream_sock: always clear BF_EXPECT_MORE upon complete transfer
+    - [CLEANUP] stream_sock: remove unneeded FL_TCP and factor out test
+    - [MEDIUM] http: add support for "http-no-delay"
+    - [OPTIM] http: optimize chunking again in non-interactive mode
+    - [OPTIM] stream_sock: avoid fast-forwarding of partial data
+    - [OPTIM] stream_sock: don't use splice on too small payloads
+    - [BUG] stats: support url-encoded forms
+    - [BUG] halog: correctly handle truncated last line
+    - [DOC] fix typos, "#" is a sharp, not a dash
+
+2011/04/08 : 1.4.15
+    - [CRITICAL] fix risk of crash when dealing with space in response cookies
+
+2011/03/29 : 1.4.14
+    - [MINOR] config: fix endianness of server check port
+    - [BUG] http: fix possible incorrect forwarded wrapping chunk size (take 2)
+    - [MINOR] tools: add two macros MID_RANGE and MAX_RANGE
+    - [BUG] http: fix content-length handling on 32-bit platforms
+    - [OPTIM] buffers: uninline buffer_forward()
+
+2011/03/09 : 1.4.13
+    - [BUG] config: don't crash on empty pattern files.
+
+2011/03/08 : 1.4.12
+    - [MINOR] stats: add support for several packets in stats admin
+    - [BUG] stats: admin commands must check the proxy state
+    - [BUG] stats: admin web interface must check the proxy state
+    - [BUG] http: update the header list's tail when removing the last header
+    - [DOC] fix typos (http-request instead of http-check)     (cherry picked from commit 8f2a1e72bebea700f37add40997b716fdfd86b9c)
+    - [BUG] http: use correct ACL pointer when evaluating authentication
+    - [BUG] cfgparse: correctly count one socket per port in ranges
+    - [BUG] startup: set the rlimits before binding ports, not after.
+    - [BUG] acl: srv_id must return no match when the server is NULL
+    - [BUG] acl: fd leak when reading patterns from file
+    - [DOC] fix minor typo in "usesrc"
+    - [BUG] http: fix possible incorrect forwarded wrapping chunk size
+    - [BUG] http: fix computation of message body length after forwarding has started
+    - [BUG] http: balance url_param did not work with first parameters on POST
+    - [TESTS] update the url_param regression test to test check_post too
+
+2011/02/10 : 1.4.11
+    - [MINOR] cfgparse: Check whether the path given for the stats socket actually fits into the sockaddr_un structure to avoid truncation.
+    - [DOC] fix a minor typo
+    - [DOC] fix ignore-persist documentation
+    - [BUG] http: fix http-pretend-keepalive and httpclose/tunnel mode
+    - [MINOR] add warnings on features not compatible with multi-process mode
+    - [MINOR] acl: add be_id/srv_id to match backend's and server's id
+    - [MINOR] log: add support for passing the forwarded hostname
+    - [MINOR] log: ability to override the syslog tag
+    - [DOC] fix minor typos in the doc
+    - [DOC] fix another typo in the doc
+    - [BUG] http chunking: don't report a parsing error on connection errors
+    - [BUG] stream_interface: truncate buffers when sending error messages
+    - [BUG] http: fix incorrect error reporting during data transfers
+    - [CRITICAL] session: correctly leave turn-around and queue states on abort
+    - [BUG] session: release slot before processing pending connections
+    - [MINOR] stats: report HTTP message state and buffer flags in error dumps
+    - [MINOR] http: support wrapping messages in error captures
+    - [MINOR] http: capture incorrectly chunked message bodies
+    - [MINOR] stats: add global event ID and count
+    - [OPTIM] http: don't send each chunk in a separate packet
+    - [BUG] acl: fix handling of empty lines in pattern files
+    - [BUG] ebtree: fix ebmb_lookup() with len smaller than the tree's keys
+    - [OPTIM] ebtree: ebmb_lookup: reduce stack usage by moving the return code out of the loop
+
+2010/11/29 : 1.4.10
+    - [BUG] debug: report the correct poller list in verbose mode
+    - [BUG] capture: do not capture a cookie if there is no memory left
+    - [BUG] appsession: fix possible double free in case of out of memory
+    - [CRITICAL] cookies: mixing cookies in indirect mode and appsession can crash the process
+    - [BUG] http: correctly update the header list when removing two consecutive headers
+    - [BUILD] add the CPU=native and ARCH=32/64 build options
+    - [BUILD] add -fno-strict-aliasing to fix warnings with gcc >= 4.4
+
+2010/10/29 : 1.4.9
+    - [BUG] stats: session rate limit gets garbaged in the stats
+    - [DOC] fix http-request documentation
+    - [MEDIUM] enable/disable servers from the stats web interface
+    - [MEDIUM] stats: add an admin level
+    - [DOC] stats: document the "stats admin" statement
+    - [MINOR] checks: add support for LDAPv3 health checks
+    - [MINOR] add better support to "mysql-check"
+    - [BUG] Restore info about available active/backup servers
+    - [CONTRIB] Update haproxy.pl
+    - [CONTRIB] Update Cacti Tempates
+    - [CONTRIB] add templates for Cacti.
+    - [MEDIUM] http: forward client's close when abortonclose is set
+    - [BUG] queue: don't dequeue proxy-global requests on disabled servers
+    - [MEDIUM] servers: support address 0.0.0.0 as the original destination address
+    - [BUG] stats: global stats timeout may be specified before stats socket.
+    - [BUG] stream_sock: cleanly disable the listener in case of resource shortage
+    - [BUG] ebtree: string_equal_bits() could return garbage on identical strings
+    - [BUG] stream_sock: try to flush any extra pending request data after a POST
+    - [BUILD] proto_http: eliminate some build warnings with gcc-2.95
+    - [MEDIUM] make it possible to combine http-pretend-keepalived with httpclose
+    - [MEDIUM] tcp-request : don't wait for inspect-delay to expire when the buffer is full
+    - [DOC] bind option is "defer-accept", not "defer_accept"
+    - [MEDIUM] checks: add support for HTTP contents lookup
+    - [TESTS] add test-check-expect to test various http-check methods
+    - [MINOR] global: add "tune.chksize" to change the default check buffer size
+    - [MINOR] startup: release unused structs after forking
+    - [MINOR] startup: don't wait for nothing when no old pid remains
+    - [BUG] http: don't consider commas as a header delimitor within quotes
+    - [DOC] fix typo in the queue() definition (backend, not frontend)
+    - [DOC] fix typo in the avg_queue() and be_conn() definition (backend, not frontend)
+    - [BUG] deinit: unbind listeners before freeing them
+    - [MINOR] halog: add '-tc' to sort by termination codes
+    - [MINOR] halog: skip non-traffic logs for -st and -tc
+    - [DOC] add a summary about cookie incompatibilities between specs and browsers
+    - [DOC] fix description of cookie "insert" and "indirect" modes
+    - [MEDIUM] http: fix space handling in the request cookie parser
+    - [MEDIUM] http: fix space handling in the response cookie parser
+    - [MINOR] cookie: add options "maxidle" and "maxlife"
+    - [MEDIUM] cookie: support client cookies with some contents appended to their value
+    - [MINOR] http: make some room in the transaction flags to extend cookies
+    - [MINOR] cookie: add the expired (E) and old (O) flags for request cookies
+    - [MEDIUM] cookie: reassign set-cookie status flags to store more states
+    - [MINOR] add encode/decode function for 30-bit integers from/to base64
+    - [MEDIUM] cookie: check for maxidle and maxlife for incoming dated cookies
+    - [MEDIUM] cookie: set the date in the cookie if needed
+    - [DOC] document the cookie maxidle and maxlife parameters
+    - [BUG] checks: don't log backend down for all zero-weight servers
+    - [MEDIUM] checks: set server state to one state from failure when leaving maintenance
+    - [BUG] config: report correct keywords for "observe"
+    - [MINOR] checks: ensure that we can inherit binary checks from the defaults section
+    - [MINOR] acl: add the http_req_first match
+    - [DOC] fix typos about bind-process syntax
+    - [BUG] cookie: correctly unset default cookie parameters
+    - [MINOR] cookie: add support for the "preserve" option
+    - [DOC] missing index entry for http-check send-state
+    - [BUG] ebtree: fix duplicate strings insertion
+    - [CONTRIB] halog: report per-url counts, errors and times
+    - [CONTRIB] halog: minor speed improvement in timer parser
+    - [BUG] http: denied requests must not be counted as denied resps in listeners
+    - [BUG] config: report the correct proxy type in tcp-request errors
+    - [BUG] proto_tcp: potential bug on pattern fetch dst and dport
+
+2010/06/16 : 1.4.8
+    - [DOC] mention 'option http-server-close' effect in Tq section
+    - [DOC] summarize and highlight persistent connections behaviour
+    - [DOC] add configuration samples
+    - [BUG] stick_table: the fix for the memory leak caused a regression
+    - [BUG] client: don't add a new session to the list too early
+
+2010/06/07 : 1.4.7
+    - [BUG] http: dispatch and http_proxy modes were broken for a long time
+    - [BUG] http: the transaction must be initialized even in TCP mode
+    - [BUG] tcp: dropped connections must be counted as "denied" not "failed"
+    - [BUG] consistent hash: balance on all servers, not only 2 !
+    - [CONTRIB] halog: report per-server status codes, errors and response times
+    - [BUG] http: the transaction must be initialized even in TCP mode (part 2)
+    - [BUG] stick_table: fix possible memory leak in case of connection error
+    - [BUG] proxy: connection rate limiting was eating lots of CPU
+    - [BUG] frontend: always ensure to zero rep->analysers
+    - [BUG] http: report correct flags in case of client aborts during body
+    - [TESTS] refine non-regression tests and add 4 new tests
+    - [BUG] debug: wrong pointer was used to report a status line
+    - [BUG] debug: correctly report truncated messages
+    - [DOC] document the "dispatch" keyword
+
+2010/05/16 : 1.4.6
+    - [BUILD] ebtree: update to v6.0.1 to remove references to dprintf()
+    - [CLEANUP] acl: make use of eb_is_empty() instead of open coding the tree's emptiness test
+    - [MINOR] acl: add srv_is_up() to check that a specific server is up or not
+    - [DOC] add a few precisions about the use of RDP cookies
+
+2010/05/13 : 1.4.5
+    - [DOC] report minimum kernel version for tproxy in the Makefile
+    - [MINOR] add the "ignore-persist" option to conditionally ignore persistence
+    - [DOC] add the "ignore-persist" option to conditionally ignore persistence
+    - [DOC] fix ignore-persist/force-persist documentation
+    - [BUG] cttproxy: socket fd leakage in check_cttproxy_version
+    - [DOC] doc/configuration.txt: fix typos
+    - [MINOR] option http-pretend-keepalive is both for FEs and BEs
+    - [MINOR] fix possible crash in debug mode with invalid responses
+    - [MINOR] halog: add support for statisticts on status codes
+    - [OPTIM] halog: use a faster zero test in fgets()
+    - [OPTIM] halog: minor speedup by using unlikely()
+    - [OPTIM] halog: speed up fgets2-64 by about 10%
+    - [DOC] refresh the README file and merge the CONTRIB file into it
+    - [MINOR] acl: support loading values from files
+    - [MEDIUM] ebtree: upgrade to version 6.0
+    - [MINOR] acl trees: add flags and union members to store values in trees
+    - [MEDIUM] acl: add ability to insert patterns in trees
+    - [MEDIUM] acl: add tree-based lookups of exact strings
+    - [MEDIUM] acl: add tree-based lookups of networks
+    - [MINOR] acl: ignore empty lines and comments in pattern files
+    - [MINOR] stick-tables: add support for "stick on hdr"
+
+2010/04/07 : 1.4.4
+    - [BUG] appsession should match the whole cookie name
+    - [CLEANUP] proxy: move PR_O_SSL3_CHK to options2 to release one flag
+    - [MEDIUM] backend: move the transparent proxy address selection to backend
+    - [MINOR] add very fast IP parsing functions
+    - [MINOR] add new tproxy flags for dynamic source address binding
+    - [MEDIUM] add ability to connect to a server from an IP found in a header
+    - [BUILD] config: last patch breaks build without CONFIG_HAP_LINUX_TPROXY
+    - [MINOR] http: make it possible to pretend keep-alive when doing close
+    - [MINOR] config: report "default-server" instead of "(null)" in error messages
+
+2010/03/30 : 1.4.3
+    - [CLEANUP] stats: remove printf format warning in stats_dump_full_sess_to_buffer()
+    - [MEDIUM] session: better fix for connection to servers with closed input
+    - [DOC] indicate in the doc how to bind to port ranges
+    - [BUG] backend: L7 hashing must not be performed on incomplete requests
+    - [TESTS] add a simple program to test connection resets
+    - [MINOR] cli: "show errors" should display "backend <NONE>" when backend was not used
+    - [MINOR] config: emit warnings when HTTP-only options are used in TCP mode
+    - [MINOR] config: allow "slowstart 0s"
+    - [BUILD] 'make tags' did not consider files ending in '.c'
+    - [MINOR] checks: add the ability to disable a server in the config
+
+2010/03/17 : 1.4.2
+    - [CLEANUP] product branch update
+    - [DOC] Some more documentation cleanups
+    - [BUG] clf logs segfault when capturing a non existant header
+    - [OPTIM] config: only allocate check buffer when checks are enabled
+    - [MEDIUM] checks: support multi-packet health check responses
+    - [CLEANUP] session: remove duplicate test
+    - [BUG] http: don't wait for response data to leave buffer is client has left
+    - [MINOR] proto_uxst: set accept_date upon accept() to the wall clock time
+    - [MINOR] stats: don't send empty lines in "show errors"
+    - [MINOR] stats: make the data dump function reusable for other purposes
+    - [MINOR] stats socket: add show sess <id> to dump details about a session
+    - [BUG] stats: connection reset counters must be plain ascii, not HTML
+    - [BUG] url_param hash may return a down server
+    - [MINOR] force null-termination of hostname
+    - [MEDIUM] connect to servers even when the input has already been closed
+    - [BUG] don't merge anonymous ACLs !
+    - [BUG] config: fix endless loop when parsing "on-error"
+    - [MINOR] http: don't mark a server as failed when it returns 501/505
+    - [OPTIM] checks: try to detect the end of response without polling again
+    - [BUG] checks: don't report an error when recv() returns an error after data
+    - [BUG] checks: don't abort when second poll returns an error
+    - [MINOR] checks: make shutdown() silently fail
+    - [BUG] http: fix truncated responses on chunk encoding when size divides buffer size
+    - [BUG] init: unconditionally catch SIGPIPE
+    - [BUG] checks: don't wait for a close to start parsing the response
+
+2010/03/04 : 1.4.1
+    - [BUG] Clear-cookie path issue
+    - [DOC] fix typo on stickiness rules
+    - [BUILD] fix BSD and OSX makefiles for missing files
+    - [BUILD] includes order breaks OpenBSD build
+    - [BUILD] fix some build warnings on Solaris with is* macros
+    - [BUG] logs: don't report "last data" when we have just closed after an error
+    - [BUG] logs: don't report "proxy request" when server closes early
+    - [BUILD] fix platform-dependant build issues related to crypt()
+    - [STATS] count transfer aborts caused by client and by server
+    - [STATS] frontend requests were not accounted for failed requests
+    - [MINOR] report total number of processed connections when stopping a proxy
+    - [DOC] be more clear about the limitation to one single monitor-net entry
+
+2010/02/26 : 1.4.0
+    - [MINOR] stats: report maint state for tracking servers too
+    - [DOC] fix summary to add pattern extraction
+    - [DOC] Documentation cleanups
+    - [BUG] cfgparse memory leak and missing free calls in deinit()
+    - [BUG] pxid/puid/luid: don't shift IDs when some of them are forced
+    - [EXAMPLES] add auth.cfg
+    - [BUG] uri_auth: ST_SHLGNDS should be 0x00000008 not 0x0000008
+    - [BUG] uri_auth: do not attemp to convert uri_auth -> http-request more than once
+    - [BUILD] auth: don't use unnamed unions
+    - [BUG] config: report unresolvable host names as errors
+    - [BUILD] fix build breakage with DEBUG_FULL
+    - [DOC] fix a typo about timeout check and clarify the explanation.
+    - [MEDIUM] http: don't use trash to realign large buffers
+    - [STATS] report HTTP requests (total and rate) in frontends
+    - [STATS] separate frontend and backend HTTP stats
+    - [MEDIUM] http: revert to use a swap buffer for realignment
+    - [MINOR] stats: report the request rate in frontends as cell titles
+    - [MINOR] stats: mark areas with an underline when tooltips are available
+    - [DOC] reorder some entries to maintain the alphabetical order
+    - [DOC] cleanup of the keyword matrix
+
+2010/02/02 : 1.4-rc1
+    - [MEDIUM] add a maintenance mode to servers
+    - [MINOR] http-auth: last fix was wrong
+    - [CONTRIB] add base64rev-gen.c that was used to generate the base64rev table.
+    - [MINOR] Base64 decode
+    - [MINOR] generic auth support with groups and encrypted passwords
+    - [MINOR] add ACL_TEST_F_NULL_MATCH
+    - [MINOR] http-request: allow/deny/auth support for frontend/backend/listen
+    - [MINOR] acl: add http_auth and http_auth_group
+    - [MAJOR] use the new auth framework for http stats
+    - [DOC] add info about userlists, http-request and http_auth/http_auth_group acls
+    - [STATS] make it possible to change a CLI connection timeout
+    - [BUG] patterns: copy-paste typo in type conversion arguments
+    - [MINOR] pattern: make the converter more flexible by supporting void* and int args
+    - [MINOR] standard: str2mask: string to netmask converter
+    - [MINOR] pattern: add support for argument parsers for converters
+    - [MINOR] pattern: add the "ipmask()" converting function
+    - [MINOR] config: off-by-one in "stick-table" after list of converters
+    - [CLEANUP] acl, patterns: make use of my_strndup() instead of malloc+memcpy
+    - [BUG] restore accidentely removed line in last patch !
+    - [MINOR] checks: make the HTTP check code add the CRLF itself
+    - [MINOR] checks: add the server's status in the checks
+    - [BUILD] halog: make without arch-specific optimizations
+    - [BUG] halog: fix segfault in case of empty log in PCT mode (cherry picked from commit fe362fe4762151d209b9656639ee1651bc2b329d)
+    - [MINOR] http: disable keep-alive when process is going down
+    - [MINOR] acl: add build_acl_cond() to make it easier to add ACLs in config
+    - [CLEANUP] config: use build_acl_cond() instead of parse_acl_cond()
+    - [CLEANUP] config: use warnif_cond_requires_resp() to check for bad ACLs
+    - [MINOR] prepare req_*/rsp_* to receive a condition
+    - [CLEANUP] config: specify correct const char types to warnif_* functions
+    - [MEDIUM] config: factor out the parsing of 20 req*/rsp* keywords
+    - [MEDIUM] http: make the request filter loop check for optional conditions
+    - [MEDIUM] http: add support for conditional request filter execution
+    - [DOC] add some build info about the AIX platform (cherry picked from commit e41914c77edbc40aebf827b37542d37d758e371e)
+    - [MEDIUM] http: add support for conditional request header addition
+    - [MEDIUM] http: add support for conditional response header rewriting
+    - [DOC] add some missing ACLs about response header matching
+    - [MEDIUM] http: add support for proxy authentication
+    - [MINOR] http-auth: make the 'unless' keyword work as expected
+    - [CLEANUP] config: use build_acl_cond() to simplify http-request ACL parsing
+    - [MEDIUM] add support for anonymous ACLs
+    - [MEDIUM] http: switch to tunnel mode after status 101 responses
+    - [MEDIUM] http: stricter processing of the CONNECT method
+    - [BUG] config: reset check request to avoid double free when switching to ssl/sql
+    - [MINOR] config: fix too large ssl-hello-check message.
+    - [BUG] fix error response in case of server error
+
+2010/01/25 : 1.4-dev8
+    - [CLEANUP] Keep in sync "defaults" support between documentation and code
+    - [MEDIUM] http: add support for Proxy-Connection header
+    - [CRITICAL] buffers: buffer_insert_line2 must not change the ->w entry
+    - [MINOR] http: remove a copy-paste typo in transaction cleaning
+    - [BUG] http: trim any excess buffer data when recycling a connection
+
+2010/01/25 : 1.4-dev7
+    - [BUG] appsession: possible memory leak in case of out of memory condition
+    - [MINOR] config: don't accept 'appsession' in defaults section
+    - [MINOR] Add function to parse a size in configuration
+    - [MEDIUM] Add stick table (persistence) management functions and types
+    - [MEDIUM] Add pattern fetch management types and functions
+    - [MEDIUM] Add src dst and dport pattern fetches.
+    - [MEDIUM] Add stick table configuration and init.
+    - [MEDIUM] Add stick and store rules analysers.
+    - [MINOR] add option "mysql-check" to use MySQL health checks
+    - [BUG] health checks: fix requeued message
+    - [OPTIM] remove SSP_O_VIA and SSP_O_STATUS
+    - [BUG] checks: fix newline termination
+    - [MINOR] acl: add fe_id/so_id to match frontend's and socket's id
+    - [BUG] appsession's sessid must be reset at end of transaction
+    - [BUILD] appsession did not build anymore under gcc-2.95
+    - [BUG] server redirection used an uninitialized string.
+    - [MEDIUM] http: fix handling of message pointers
+    - [MINOR] http: fix double slash prefix with server redirect
+    - [MINOR] http redirect: add the ability to append a '/' to the URL
+    - [BUG] stream_interface: fix retnclose and remove cond_close
+    - [MINOR] http redirect: don't explicitly state keep-alive on 1.1
+    - [MINOR] http: move appsession 'sessid' from session to http_txn
+    - [OPTIM] reorder http_txn to optimize cache lines placement
+    - [MINOR] http: differentiate waiting for new request and waiting for a complete requst
+    - [MINOR] http: add a separate "http-keep-alive" timeout
+    - [MINOR] config: remove undocumented and buggy 'timeout appsession'
+    - [DOC] fix various too large lines
+    - [DOC] remove several trailing spaces
+    - [DOC] add the doc about stickiness
+    - [BUILD] remove a warning in standard.h on AIX
+    - [BUG] checks: chars are unsigned on AIX, check was always true
+    - [CLEANUP] stream_sock: MSG_NOSIGNAL is only for send(), not recv()
+    - [BUG] check: we must not check for error before reading a response
+    - [BUG] buffers: remove remains of wrong obsolete length check
+    - [OPTIM] stream_sock: don't shutdown(write) when the socket is in error
+    - [BUG] http: don't count req errors on client resets or t/o during keep-alive
+    - [MEDIUM] http: don't switch to tunnel mode upon close
+    - [DOC] add documentation about connection header processing
+    - [MINOR] http: add http_remove_header2() to remove a header value.
+    - [MINOR] tools: add a "word_match()" function to match words and ignore spaces
+    - [MAJOR] http: rework request Connection header handling
+    - [MAJOR] http: rework response Connection header handling
+    - [MINOR] add the ability to force kernel socket buffer size.
+    - [BUG] http_server_error() must not purge a previous pending response
+    - [OPTIM] http: don't delay response if next request is incomplete
+    - [MINOR] add the "force-persist" statement to force persistence on down servers
+    - [MINOR] http: logs must report persistent connections to down servers
+    - [BUG] buffer_replace2 must never change the ->w entry
+
+2010/01/08 : 1.4-dev6
+    - [BUILD] warning in stream_interface.h
+    - [BUILD] warning ultoa_r returns char *
+    - [MINOR] hana: only report stats if it is enabled
+    - [MINOR] stats: add "a link" & "a href" for sockets
+    - [MINOR]: stats: add show-legends to report additional informations
+    - [MEDIUM] default-server support
+    - [BUG]: add 'observer', 'on-error', 'error-limit' to supported options list
+    - [MINOR] stats: add href to tracked server
+    - [BUG] stats: show UP/DOWN status also in tracking servers
+    - [DOC] Restore ability to search a keyword at the beginning of a line
+    - [BUG] stats: cookie should be reported under backend not under proxy
+    - [BUG] cfgparser/stats: fix error message
+    - [BUG] http: disable auto-closing during chunk analysis
+    - [BUG] http: fix hopefully last closing issue on data forwarding
+    - [DEBUG] add an http_silent_debug function to debug HTTP states
+    - [MAJOR] http: fix again the forward analysers
+    - [BUG] http_process_res_common() must not skip the forward analyser
+    - [BUG] http: some possible missed close remain in the forward chain
+    - [BUG] http: redirect needed to be updated after recent changes
+    - [BUG] http: don't set no-linger on response in case of forced close
+    - [MEDIUM] http: restore the original behaviour of option httpclose
+    - [TESTS] add a file to test various connection modes
+    - [BUG] http: check options before the connection header
+    - [MAJOR] session: fix the order by which the analysers are run
+    - [MEDIUM] session: also consider request analysers added during response
+    - [MEDIUM] http: make safer use of the DONT_READ and AUTO_CLOSE flags
+    - [BUG] http: memory leak with captures when using keep-alive
+    - [BUG] http: fix for capture memory leak was incorrect
+    - [MINOR] http redirect: use proper call to return last response
+    - [MEDIUM] http: wait for some flush of the response buffer before a new request
+    - [MEDIUM] session: limit the number of analyser loops
+
+2010/01/03 : 1.4-dev5
+    - [MINOR] server tracking: don't care about the tracked server's mode
+    - [MEDIUM] appsession: add "len", "prefix" and "mode" options
+    - [MEDIUM] appsession: add the "request-learn" option
+    - [BUG] Configuration parser bug when escaping characters
+    - [MINOR] CSS & HTML fun
+    - [MINOR] Collect & provide http response codes received from servers
+    - [BUG] Fix silly typo: hspr_other -> hrsp_other
+    - [MINOR] Add "a name" to stats page
+    - [MINOR] add additional "a href"s to stats page
+    - [MINOR] Collect & provide http response codes for frontends, fix backends
+    - [DOC] some small spell fixes and unifications
+    - [MEDIUM] Decrease server health based on http responses / events, version 3
+    - [BUG] format '%d' expects type 'int', but argument 5 has type 'long int'
+    - [BUG] config: fix erroneous check on cookie domain names, again
+    - [BUG] Healthchecks: get a proper error code if connection cannot be completed immediately
+    - [DOC] trivial fix for man page
+    - [MINOR] config: report all supported options for the "bind" keyword
+    - [MINOR] tcp: add support for the defer_accept bind option
     - [MINOR] unix socket: report the socket path in case of bind error
     - [CONTRIB] halog: support searching by response time
     - [DOC] add a reminder about obsolete documents
+    - [DOC] point to 1.4 doc, not 1.3
+    - [DOC] option tcp-smart-connect was missing from index
+    - [MINOR] http: detect connection: close earlier
+    - [CLEANUP] sepoll: clean up the fd_clr/fd_set functions
+    - [OPTIM] move some rarely used fields out of fdtab
+    - [MEDIUM] fd: merge fd_list into fdtab
+    - [MAJOR] buffer: flag BF_DONT_READ to disable reads when not required
+    - [MINOR] http: add new transaction flags for keep-alive and content-length
+    - [MEDIUM] http request: parse connection, content-length and transfer-encoding
+    - [MINOR] http request: update the TX_SRV_CONN_KA flag on rewrite
+    - [MINOR] http request: simplify the test of no-data
+    - [MEDIUM] http request: simplify POST length detection
+    - [MEDIUM] http request: make use of pre-parsed transfer-encoding header
+    - [MAJOR] http: create the analyser which waits for a response
+    - [MINOR] http: pre-set the persistent flags in the transaction
+    - [MEDIUM] http response: check body length and set transaction flags
+    - [MINOR] http response: update the TX_CLI_CONN_KA flag on rewrite
+    - [MINOR] http: remove the last call to stream_int_return
+    - [IMPORT] import ebtree v5.0 into directory ebtree/
+    - [MEDIUM] build: switch ebtree users to use new ebtree version
+    - [CLEANUP] ebtree: remove old unused files
+    - [BUG] definitely fix regparm issues between haproxy core and ebtree
+    - [CLEANUP] ebtree: cast to char * to get rid of gcc warning
+    - [BUILD] missing #ifndef in ebmbtree.h
+    - [BUILD] missing #ifndef in ebsttree.h
+    - [MINOR] tools: add hex2i() function to convert hex char to int
+    - [MINOR] http: create new MSG_BODY sub-states
+    - [BUG] stream_sock: BUF_INFINITE_FORWARD broke splice on 64-bit platforms
+    - [DOC] option is "defer-accept", not "defer_accept"
+    - [MINOR] http: keep pointer to beginning of data
+    - [BUG] x-original-to: name was not set in default instance
+    - [MINOR] http: detect tunnel mode and set it in the session
+    - [BUG] config: fix error message when config file is not found
+    - [BUG] config: fix wrong handling of too large argument count
+    - [BUG] config: disable 'option httplog' on TCP proxies
+    - [BUG] config: fix erroneous check on cookie domain names
+    - [BUG] config: cookie domain was ignored in defaults sections
+    - [MINOR] config: support passing multiple "domain" statements to cookies
+    - [MINOR] ebtree: add functions to lookup non-null terminated strings
+    - [MINOR] config: don't report error on all subsequent files on failure
+    - [BUG] second fix for the printf format warning
+    - [BUG] check_post: limit analysis to the buffer length
+    - [MEDIUM] http: process request body in a specific analyser
+    - [MEDIUM] backend: remove HTTP POST parsing from get_server_ph_post()
+    - [MAJOR] http: completely process the "connection" header
+    - [MINOR] http: only consider chunk encoding with HTTP/1.1
+    - [MAJOR] buffers: automatically compute the maximum buffer length
+    - [MINOR] http: move the http transaction init/cleanup code to proto_http
+    - [MINOR] http: move 1xx handling earlier to eliminate a lot of ifs
+    - [MINOR] http: introduce a new synchronisation state : HTTP_MSG_DONE
+    - [MEDIUM] http: rework chunk-size parser
+    - [MEDIUM] http: add a new transaction flags indicating if we know the transfer length
+    - [MINOR] buffers: add buffer_ignore() to skip some bytes
+    - [BUG] http: offsets are relative to the buffer, not to ->som
+    - [MEDIUM] http: automatically re-aling request buffer
+    - [BUG] http: body parsing must consider the start of message
+    - [MINOR] new function stream_int_cond_close()
+    - [MAJOR] http: implement body parser
+    - [BUG] http: typos on several unlikely() around header insertion
+    - [BUG] stream_sock: wrong max computation on recv
+    - [MEDIUM] http: rework the buffer alignment logic
+    - [BUG] buffers: wrong size calculation for displaced data
+    - [MINOR] stream_sock: prepare for closing when all pending data are sent
+    - [MEDIUM] http: add two more states for the closing period
+    - [MEDIUM] http: properly handle "option forceclose"
+    - [MINOR] stream_sock: add SI_FL_NOLINGER for faster close
+    - [MEDIUM] http: make forceclose use SI_FL_NOLINGER
+    - [MEDIUM] session: set SI_FL_NOLINGER when aborting on write timeouts
+    - [MEDIUM] http: add some SI_FL_NOLINGER around server errors
+    - [MINOR] config: option forceclose is valid in frontends too
+    - [BUILD] halog: insufficient include path in makefile
+    - [MEDIUM] http: make the analyser not rely on msg being initialized anymore
+    - [MEDIUM] http: make the parsers able to wait for a buffer flush
+    - [MAJOR] http: add support for option http-server-close
+    - [BUG] http: ensure we abort data transfer on write error
+    - [BUG] last fix was overzealous and disabled server-close
+    - [BUG] http: fix erroneous trailers size computation
+    - [MINOR] stream_sock: enable MSG_MORE when forwarding finite amount of data
+    - [OPTIM] http: set MSG_MORE on response when a pipelined request is pending
+    - [BUG] http: redirects were broken by chunk changes
+    - [BUG] http: the request URI pointer is relative to the buffer
+    - [OPTIM] http: don't immediately enable reading on request
+    - [MINOR] http: move redirect messages to HTTP/1.1 with a content-length
+    - [BUG] http: take care of errors, timeouts and aborts during the data phase
+    - [MINOR] http: don't wait for sending requests to the server
+    - [MINOR] http: make the conditional redirect support keep-alive
+    - [BUG] http: fix cookie parser to support spaces and commas in values
+    - [MINOR] config: some options were missing for "redirect"
+    - [MINOR] redirect: add support for unconditional rules
+    - [MINOR] config: centralize proxy struct initialization
+    - [MEDIUM] config: remove the limitation of 10 reqadd/rspadd statements
+    - [MEDIUM] config: remove the limitation of 10 config files
+    - [CLEANUP] http: remove a remaining impossible condition
+    - [OPTIM] http: optimize a bit the construct of the forward loops
 
-2009/10/12 : 1.3.21
+2009/10/12 : 1.4-dev4
     - [DOC] add missing rate_lim and rate_max
+    - [MAJOR] struct chunk rework
+    - [MEDIUM] Health check reporting code rework + health logging, v3
     - [BUG] check if rise/fall has an argument and it is > 0
+    - [MINOR] health checks logging unification
     - [MINOR] add "description", "node" and show-node"/"show-desc", remove "node-name", v2
+    - [MINOR] Allow dots in show-node & add "white-space: nowrap" in th.pxname.
     - [DOC] Add information about http://haproxy.1wt.eu/contrib.html
+    - [MINOR] Introduce include/types/counters.h
+    - [CLEANUP] Move counters to dedicated structures
+    - [MINOR] Add "clear counters" to clear statistics counters
+    - [MEDIUM] Collect & provide separate statistics for sockets, v2
+    - [BUG] Fix NULL pointer dereference in stats_check_uri_auth(), v2
     - [MINOR] acl: don't report valid acls as potential mistakes
+    - [MINOR] Add cut_crlf(), ltrim(), rtrim() and alltrim()
+    - [MINOR] Add chunk_htmlencode and chunk_asciiencode
+    - [MINOR] Capture & display more data from health checks, v2
     - [BUG] task.c: don't assing last_timer to node-less entries
+    - [BUG] http stats: large outputs sometimes got some parts chopped off
+    - [MINOR] backend: export some functions to recount servers
+    - [MINOR] backend: uninline some LB functions
+    - [MINOR] include time.h from freq_ctr.h as is uses "now".
+    - [CLEANUP] backend: move LB algos to individual files
+    - [MINOR] lb_map: reorder code in order to ease integration of new hash functions
+    - [CLEANUP] proxy: move last lb-specific bits to their respective files
+    - [MINOR] backend: separate declarations of LB algos from their lookup method
+    - [MINOR] backend: reorganize the LB algorithm selection
+    - [MEDIUM] backend: introduce the "static-rr" LB algorithm
+    - [MINOR] report list of supported pollers with -vv
+    - [DOC] log-health-checks is an option, not a directive
+    - [MEDIUM] new option "independant-streams" to stop updating read timeout on writes
+    - [BUG] stats: don't call buffer_shutw(), but ->shutw() instead
+    - [MINOR] stats: strip CR and LF from the input command line
+    - [BUG] don't refresh timeouts late after detected activity
+    - [MINOR] stats_dump_errors_to_buffer: use buffer_feed_chunk()
+    - [MINOR] stats_dump_sess_to_buffer: use buffer_feed_chunk()
+    - [MINOR] stats: make stats_dump_raw_to_buffer() use buffer_feed_chunk
+    - [MEDIUM] stats: don't use s->ana_state anymore
+    - [MINOR] remove now obsolete ana_state from the session struct
+    - [MEDIUM] stats: make HTTP stats use an I/O handler
+    - [MEDIUM] stream_int: adjust WAIT_ROOM handling
+    - [BUG] config: look for ID conflicts in all sockets, not only last ones.
+    - [MINOR] config: reference file and line with any listener/proxy/server declaration
+    - [MINOR] config: report places of duplicate names or IDs
+    - [MINOR] config: add pointer to file name in block/redirect/use_backend/monitor rules
+    - [MINOR] tools: add a new get_next_id() function
+    - [MEDIUM] config: automatically find unused IDs for proxies, servers and listeners
+    - [OPTIM] counters: move some max numbers to the counters struct
+    - [BUG] counters: fix segfault on missing counters for a listener
+    - [MEDIUM] backend: implement consistent hashing variation
+    - [MINOR] acl: add fe_conn, be_conn, queue, avg_queue
+    - [MINOR] stats: use 'clear counters all' to clear all values
+    - [MEDIUM] add access restrictions to the stats socket
+    - [MINOR] buffers: add buffer_feed2() and make buffer_feed() measure string length
+    - [MINOR] proxy: provide function to retrieve backend/server pointers
+    - [MINOR] add the "initial weight" to the server struct.
+    - [MEDIUM] stats: add the "get weight" command to report a server's weight
+    - [MEDIUM] stats: add the "set weight" command
+    - [BUILD] add a 'make tags' target
+    - [MINOR] stats: add support for numeric IDs in set weight/get weight
+    - [MINOR] stats: use a dedicated state to output static data
+    - [OPTIM] stats: check free space before trying to print
+
+2009/09/24 : 1.4-dev3
+    - [BUILD] compilation of haproxy-1.4-dev2 on FreeBSD
+    - [MEDIUM] Collect & show information about last health check, v3
     - [MINOR] export the hostname variable so that all the code can access it
     - [MINOR] stats: add a new node-name setting
-    - [MINOR] acl: add support for hdr_ip to match IP addresses in headers
+    - [MEDIUM] remove old experimental tcpsplice option
+    - [BUILD] fix build for systems without SOL_TCP
+    - [MEDIUM] move connection establishment from backend to the SI.
+    - [MEDIUM] make the global stats socket part of a frontend
+    - [MEDIUM] session: account per-listener connections
+    - [MINOR] session: switch to established state if no connect function
+    - [MEDIUM] make the unix stats sockets use the generic session handler
+    - [CLEANUP] unix: remove uxst_process_session()
+    - [CLEANUP] move remaining stats sockets code to dumpstats
+    - [MINOR] move the initial task's nice value to the listener
+    - [MINOR] cleanup set_session_backend by using pre-computed analysers
+    - [MINOR] set s->srv_error according to the analysers
+    - [MEDIUM] set rep->analysers from fe and be analysers
+    - [MEDIUM] replace BUFSIZE with buf->size in computations
+    - [MEDIUM] make it possible to change the buffer size in the configuration
+    - [MEDIUM] report error on buffer writes larger than buffer size
+    - [MEDIUM] stream_interface: add and use ->update function to resync
     - [CLEANUP] remove ifdef MSG_NOSIGNAL and define it instead
+    - [MEDIUM] remove TCP_CORK and make use of MSG_MORE instead
+    - [BUG] tarpit did not work anymore
+    - [MINOR] acl: add support for hdr_ip to match IP addresses in headers
+    - [MAJOR] buffers: fix misuse of the BF_SHUTW_NOW flag
+    - [MINOR] buffers: provide more functions to handle buffer data
+    - [MEDIUM] buffers: provide new buffer_feed*() function
+    - [MINOR] buffers: add peekchar and peekline functions for stream interfaces
+    - [MINOR] buffers: provide buffer_si_putchar() to send a char from a stream interface
     - [BUG] buffer_forward() would not correctly consider data already scheduled
+    - [MINOR] buffers: add buffer_cut_tail() to cut only unsent data
+    - [MEDIUM] stream_interface: make use of buffer_cut_tail() to report errors
     - [MAJOR] http: add support for HTTP 1xx informational responses
+    - [MINOR] buffers: inline buffer_si_putchar()
+    - [MAJOR] buffers: split BF_WRITE_ENA into BF_AUTO_CONNECT and BF_AUTO_CLOSE
+    - [MAJOR] buffers: fix the BF_EMPTY flag's meaning
+    - [BUG] stream_interface: SI_ST_CLO must have buffers SHUT
+    - [MINOR] stream_sock: don't set SI_FL_WAIT_DATA if BF_SHUTW_NOW is set
+    - [MEDIUM] add support for infinite forwarding
     - [BUILD] stream_interface: fix conflicting declaration
-    - [CLEANUP] include time.h from freq_ctr.h as it uses "now".
-    - [MINOR] report list of supported pollers with -vv
-    - [MEDIUM] new option "independant-streams" to stop updating read timeout on writes
-    - [BUG] don't refresh timeouts late after detected activity
-    - [MINOR] acl: add fe_conn, be_conn, queue, avg_queue
-    - [BUILD] add a 'make tags' target (cherry picked from commit ebe0af4b77bca2042565a3f15fc1f597f5862874)
+    - [BUG] buffers: buffer_forward() must not always clear BF_OUT_EMPTY
+    - [BUG] variable buffer size ignored at initialization time
+    - [MINOR] ensure that buffer_feed() and buffer_skip() set BF_*_PARTIAL
+    - [BUG] fix buffer_skip() and buffer_si_getline() to correctly handle wrap-arounds
+    - [MINOR] stream_interface: add SI_FL_DONT_WAKE flag
+    - [MINOR] stream_interface: add iohandler callback
+    - [MINOR] stream_interface: add functions to support running as internal/external tasks
+    - [MEDIUM] session: call iohandler for embedded tasks (applets)
+    - [MINOR] add a ->private member to the stream_interface
+    - [MEDIUM] stats: prepare the connection for closing before dumping
+    - [MEDIUM] stats: replace the stats socket analyser with an SI applet
 
-2009/08/09 : 1.3.20
+2009/08/09 : 1.4-dev2
     - [BUG] task: fix possible crash when some timeouts are not configured
     - [BUG] log: option tcplog would log to global if no logger was defined
 
-2009/07/27 : 1.3.19
+2009/07/29 : 1.4-dev1
+    - [MINOR] acl: add support for matching of RDP cookies
+    - [MEDIUM] add support for RDP cookie load-balancing
+    - [MEDIUM] add support for RDP cookie persistence
+    - [MINOR] add a new CLF log format
     - [MINOR] startup: don't imply -q with -D
     - [BUG] ensure that we correctly re-start old process in case of error
     - [MEDIUM] add support for binding to source port ranges during connect
+    - [MINOR] config: track "no option"/"option" changes
+    - [MINOR] config: support resetting options do default values
+    - [MEDIUM] implement option tcp-smart-accept at the frontend
+    - [MEDIUM] stream_sock: implement tcp-cork for use during shutdowns on Linux
+    - [MEDIUM] implement tcp-smart-connect option at the backend
+    - [MEDIUM] add support for TCP MSS adjustment for listeners
     - [MEDIUM] support setting a server weight to zero
     - [MINOR] make DEFAULT_MAXCONN user-configurable at build time
+    - [MAJOR] session: don't clear buffer status flags anymore
+    - [MAJOR] session: only check for timeouts when they have just occurred.
+    - [MAJOR] session: simplify buffer error handling
     - [MEDIUM] config: split parser and checker in two functions
     - [MEDIUM] config: support loading multiple configuration files
+    - [MEDIUM] stream_sock: don't close prematurely when nolinger is set
+    - [MEDIUM] session: rework buffer analysis to permit permanent analysers
+    - [MEDIUM] splice: set the capability on each stream_interface
     - [BUG] http: redirect rules were processed too early
     - [CLEANUP] remove unused DEBUG_PARSE_NO_SPEEDUP define
+    - [MEDIUM] http: split request waiter from request processor
+    - [MEDIUM] session: tell analysers what bit they were called for
+    - [MAJOR] http: complete splitting of the remaining stages
+    - [MINOR] report in the proxies the requirements for ACLs
+    - [MINOR] http: rely on proxy->acl_requires to allocate hdr_idx
+    - [MINOR] acl: add HTTP protocol detection (req_proto_http)
+    - [MINOR] prepare callers of session_set_backend to handle errors
     - [BUG] default ACLs did not properly set the ->requires flag
+    - [MEDIUM] allow a TCP frontend to switch to an HTTP backend
+    - [MINOR] ensure we can jump from swiching rules to http without data
+    - [MINOR] http: take http request timeout from the backend
+    - [MINOR] allow TCP inspection rules to make use of HTTP ACLs
     - [BUILD] report commit date and not author's date as build date
+    - [MINOR] acl: don't complain anymore when using L7 acls in TCP
     - [BUG] stream_sock: always shutdown(SHUT_WR) before closing
     - [BUG] stream_sock: don't stop reading when the poller reports an error
     - [BUG] config: tcp-request content only accepts "if" or "unless"
     - [BUG] task: fix possible timer drift after update
+    - [MINOR] apply tcp-smart-connect option for the checks too
     - [MINOR] stats: better displaying in MSIE
     - [MINOR] config: improve error reporting in global section
     - [MINOR] config: improve error reporting in listen sections
@@ -61,6 +801,9 @@ ChangeLog :
     - [BUILD] fix incorrect printf arg count with tcp_splice
     - [BUG] fix random pauses on last segment of a series
     - [BUILD] add support for build under Cygwin
+
+2009/06/09 : 1.4-dev0
+    - exact copy of 1.3.18
 
 2009/05/10 : 1.3.18
     - [MEDIUM] add support for "balance hdr(name)"

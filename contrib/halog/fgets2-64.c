@@ -21,43 +21,44 @@
 #include <stdio.h>
 #include <unistd.h>
 
-// return 1 if the integer contains at least one zero byte
+// return non-zero if the integer contains at least one zero byte
 static inline unsigned int has_zero(unsigned int x)
 {
-	if (!(x & 0xFF000000U) ||
-	    !(x & 0xFF0000U) ||
-	    !(x & 0xFF00U) ||
-	    !(x & 0xFFU))
-		return 1;
-	return 0;
+	unsigned int y;
+
+	/* Principle: we want to perform 4 tests on one 32-bit int at once. For
+	 * this, we have to simulate an SIMD instruction which we don't have by
+	 * default. The principle is that a zero byte is the only one which
+	 * will cause a 1 to appear on the upper bit of a byte/word/etc... when
+	 * we subtract 1. So we can detect a zero byte if a one appears at any
+	 * of the bits 7, 15, 23 or 31 where it was not. It takes only one
+	 * instruction to test for the presence of any of these bits, but it is
+	 * still complex to check for their initial absence. Thus, we'll
+	 * proceed differently : we first save and clear only those bits, then
+	 * we check in the final result if one of them is present and was not.
+	 */
+	y = x;
+        y -= 0x01010101;    /* generate a carry */
+        y &= ~x;             /* clear the bits that were already set */
+        return y & 0x80808080;
 }
 
-static inline unsigned int has_zero64(unsigned long long x)
+
+// return non-zero if the argument contains at least one zero byte. See principle above.
+static inline unsigned long long has_zero64(unsigned long long x)
 {
-	unsigned long long x2;
+	unsigned long long y;
 
-	x2 = x & (x >> 8);
-	/* no need to split it further */
-	if ((x2 & 0x00FF) && (x2 & 0x00FF0000) && (x2 & 0x00FF00000000ULL) && (x2 & 0x00FF000000000000ULL))
-			return 0; // approx 11/12 return here
-
-	if (!(x & 0xff00000000000000ULL) ||
-	    !(x & 0xff000000000000ULL) ||
-	    !(x & 0xff0000000000ULL) ||
-	    !(x & 0xff00000000ULL) ||
-	    !(x & 0xff000000UL) ||
-	    !(x & 0xff0000UL) ||
-	    !(x & 0xff00UL) ||
-	    !(x & 0xffUL))
-		return 1; // approx 1/3 of the remaining return here
-
-	return 0;
+	y = x;
+	y -= 0x0101010101010101ULL;     /* generate a carry */
+	y &= ~x;                        /* clear the bits that were already set */
+	return y & 0x8080808080808080ULL;
 }
 
 #define FGETS2_BUFSIZE		(256*1024)
 const char *fgets2(FILE *stream)
 {
-	static char buffer[FGETS2_BUFSIZE + 5];
+	static char buffer[FGETS2_BUFSIZE + 68];
 	static char *end = buffer;
 	static char *line = buffer;
 
@@ -67,15 +68,35 @@ const char *fgets2(FILE *stream)
 	next = line;
 
 	while (1) {
-		/* this is a speed-up, we read 32 bits at once and check for an
+		/* this is a speed-up, we read 64 bits at once and check for an
 		 * LF character there. We stop if found then continue one at a
 		 * time.
 		 */
-		while (next < end && (((unsigned long)next) & 7) && *next != '\n')
-			next++;
 
-		/* now next is multiple of 4 or equal to end */
-		while (next <= (end-32)) {
+		if (next <= end) {
+			/* max 3 bytes tested here */
+			while ((((unsigned long)next) & 3) && *next != '\n')
+				next++;
+
+			/* maybe we have can skip 4 more bytes */
+			if ((((unsigned long)next) & 4) && !has_zero(*(unsigned int *)next ^ 0x0A0A0A0AU))
+				next += 4;
+		}
+
+		/* now next is multiple of 8 or equal to end */
+		while (next <= (end-68)) {
+			if (has_zero64(*(unsigned long long *)next ^ 0x0A0A0A0A0A0A0A0AULL))
+				break;
+			next += 8;
+			if (has_zero64(*(unsigned long long *)next ^ 0x0A0A0A0A0A0A0A0AULL))
+				break;
+			next += 8;
+			if (has_zero64(*(unsigned long long *)next ^ 0x0A0A0A0A0A0A0A0AULL))
+				break;
+			next += 8;
+			if (has_zero64(*(unsigned long long *)next ^ 0x0A0A0A0A0A0A0A0AULL))
+				break;
+			next += 8;
 			if (has_zero64(*(unsigned long long *)next ^ 0x0A0A0A0A0A0A0A0AULL))
 				break;
 			next += 8;
@@ -90,8 +111,12 @@ const char *fgets2(FILE *stream)
 			next += 8;
 		}
 
-		/* we finish if needed. Note that next might be slightly higher
-		 * than end here because we might have gone past it above.
+		/* maybe we can skip 4 more bytes */
+		if (!has_zero(*(unsigned int *)next ^ 0x0A0A0A0AU))
+			next += 4;
+
+		/* We finish if needed : if <next> is below <end>, it means we
+		 * found an LF in one of the 4 following bytes.
 		 */
 		while (next < end) {
 			if (*next == '\n') {
@@ -106,7 +131,8 @@ const char *fgets2(FILE *stream)
 
 		/* we found an incomplete line. First, let's move the
 		 * remaining part of the buffer to the beginning, then
-		 * try to complete the buffer with a new read.
+		 * try to complete the buffer with a new read. We can't
+		 * rely on <next> anymore because it went past <end>.
 		 */
 		if (line > buffer) {
 			if (end != line)
@@ -126,10 +152,12 @@ const char *fgets2(FILE *stream)
 				return NULL;
 
 			*end = '\0';
+			end = line; /* ensure we stop next time */
 			return line;
 		}
 
 		end += ret;
+		*end = '\n'; /* make parser stop ASAP */
 		/* search for '\n' again */
 	}
 }

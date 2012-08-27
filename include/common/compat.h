@@ -22,18 +22,9 @@
 #ifndef _COMMON_COMPAT_H
 #define _COMMON_COMPAT_H
 
-/*
- * Gcc before 3.0 needs [0] to declare a variable-size array
- */
-#if  __GNUC__  < 3
-#define VAR_ARRAY	0
-#else
-#define VAR_ARRAY
-#endif
-
 /* This is needed on Linux for Netfilter includes */
-#include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/socket.h>
 #include <common/config.h>
 #include <common/standard.h>
 
@@ -64,6 +55,11 @@
  */
 #ifndef MSG_DONTWAIT
 #define MSG_DONTWAIT	0
+#endif
+
+/* Only Linux defines MSG_MORE */
+#ifndef MSG_MORE
+#define MSG_MORE	0
 #endif
 
 #if defined(TPROXY) && defined(NETFILTER)

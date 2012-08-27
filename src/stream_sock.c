@@ -20,6 +20,8 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 
+#include <netinet/tcp.h>
+
 #include <common/compat.h>
 #include <common/config.h>
 #include <common/debug.h>
@@ -31,6 +33,7 @@
 #include <proto/client.h>
 #include <proto/fd.h>
 #include <proto/pipe.h>
+#include <proto/protocols.h>
 #include <proto/stream_sock.h>
 #include <proto/task.h>
 
@@ -82,6 +85,10 @@ _syscall6(int, splice, int, fdin, loff_t *, off_in, int, fdout, loff_t *, off_ou
  */
 #define SPLICE_FULL_HINT	16*1448
 
+/* how many data we attempt to splice at once when the buffer is configured for
+ * infinite forwarding */
+#define MAX_SPLICE_AT_ONCE	(1<<30)
+
 /* Returns :
  *   -1 if splice is not possible or not possible anymore and we must switch to
  *      user-land copy (eg: to_forward reached)
@@ -92,7 +99,7 @@ _syscall6(int, splice, int, fdin, loff_t *, off_in, int, fdout, loff_t *, off_ou
  *   BF_READ_NULL
  *   BF_READ_PARTIAL
  *   BF_WRITE_PARTIAL (during copy)
- *   BF_EMPTY (during copy)
+ *   BF_OUT_EMPTY (during copy)
  *   SI_FL_ERR
  *   SI_FL_WAIT_ROOM
  *   (SI_FL_WAIT_RECV)
@@ -103,7 +110,8 @@ _syscall6(int, splice, int, fdin, loff_t *, off_in, int, fdout, loff_t *, off_ou
 static int stream_sock_splice_in(struct buffer *b, struct stream_interface *si)
 {
 	int fd = si->fd;
-	int ret, max, total = 0;
+	int ret;
+	unsigned long max;
 	int retval = 1;
 
 	if (!b->to_forward)
@@ -135,8 +143,12 @@ static int stream_sock_splice_in(struct buffer *b, struct stream_interface *si)
 	/* At this point, b->pipe is valid */
 
 	while (1) {
-		max = b->to_forward;
-		if (max <= 0) {
+		if (b->to_forward == BUF_INFINITE_FORWARD)
+			max = MAX_SPLICE_AT_ONCE;
+		else
+			max = b->to_forward;
+
+		if (!max) {
 			/* It looks like the buffer + the pipe already contain
 			 * the maximum amount of data to be transferred. Try to
 			 * send those data immediately on the other side if it
@@ -184,18 +196,28 @@ static int stream_sock_splice_in(struct buffer *b, struct stream_interface *si)
 				retval = -1;
 				break;
 			}
+
+			if (errno == ENOSYS || errno == EINVAL) {
+				/* splice not supported on this end, disable it */
+				b->flags &= ~BF_KERN_SPLICING;
+				si->flags &= ~SI_FL_CAP_SPLICE;
+				put_pipe(b->pipe);
+				b->pipe = NULL;
+				return -1;
+			}
+
 			/* here we have another error */
 			si->flags |= SI_FL_ERR;
 			retval = 1;
 			break;
 		} /* ret <= 0 */
 
-		b->to_forward -= ret;
-		total += ret;
+		if (b->to_forward != BUF_INFINITE_FORWARD)
+			b->to_forward -= ret;
 		b->total += ret;
 		b->pipe->data += ret;
 		b->flags |= BF_READ_PARTIAL;
-		b->flags &= ~BF_EMPTY; /* to prevent shutdowns */
+		b->flags &= ~BF_OUT_EMPTY;
 
 		if (b->pipe->data >= SPLICE_FULL_HINT ||
 		    ret >= global.tune.recv_enough) {
@@ -252,7 +274,7 @@ int stream_sock_read(int fd) {
 		goto out_wakeup;
 
 #if defined(CONFIG_HAP_LINUX_SPLICE)
-	if (b->to_forward && b->flags & BF_KERN_SPLICING) {
+	if (b->to_forward >= MIN_SPLICE_FORWARD && b->flags & BF_KERN_SPLICING) {
 
 		/* Under Linux, if FD_POLL_HUP is set, we have reached the end.
 		 * Since older splice() implementations were buggy and returned
@@ -275,44 +297,32 @@ int stream_sock_read(int fd) {
 #endif
 	cur_read = 0;
 	while (1) {
-		/*
-		 * 1. compute the maximum block size we can read at once.
-		 */
-		if (b->l == 0) {
-			/* let's realign the buffer to optimize I/O */
-			b->r = b->w = b->lr = b->data;
-			max = b->max_len;
-		}
-		else if (b->r > b->w) {
-			max = b->data + b->max_len - b->r;
-		}
-		else {
-			max = b->w - b->r;
-			if (max > b->max_len)
-				max = b->max_len;
-		}
+		max = buffer_max_len(b) - b->l;
 
-		if (max == 0) {
+		if (max <= 0) {
 			b->flags |= BF_FULL;
 			si->flags |= SI_FL_WAIT_ROOM;
 			break;
 		}
 
 		/*
+		 * 1. compute the maximum block size we can read at once.
+		 */
+		if (b->l == 0) {
+			/* let's realign the buffer to optimize I/O */
+			b->r = b->w = b->lr = b->data;
+		}
+		else if (b->r > b->w) {
+			/* remaining space wraps at the end, with a moving limit */
+			if (max > b->data + b->size - b->r)
+				max = b->data + b->size - b->r;
+		}
+		/* else max is already OK */
+
+		/*
 		 * 2. read the largest possible block
 		 */
-		if (MSG_NOSIGNAL) {
-			ret = recv(fd, b->r, max, MSG_NOSIGNAL);
-		} else {
-			int skerr;
-			socklen_t lskerr = sizeof(skerr);
-
-			ret = getsockopt(fd, SOL_SOCKET, SO_ERROR, &skerr, &lskerr);
-			if (ret == -1 || skerr)
-				ret = -1;
-			else
-				ret = recv(fd, b->r, max, 0);
-		}
+		ret = recv(fd, b->r, max, 0);
 
 		if (ret > 0) {
 			b->r += ret;
@@ -320,25 +330,31 @@ int stream_sock_read(int fd) {
 			cur_read += ret;
 
 			/* if we're allowed to directly forward data, we must update send_max */
-			if (b->to_forward > 0) {
-				int fwd = MIN(b->to_forward, ret);
-				b->send_max   += fwd;
-				b->to_forward -= fwd;
+			if (b->to_forward && !(b->flags & (BF_SHUTW|BF_SHUTW_NOW))) {
+				unsigned long fwd = ret;
+				if (b->to_forward != BUF_INFINITE_FORWARD) {
+					if (fwd > b->to_forward)
+						fwd = b->to_forward;
+					b->to_forward -= fwd;
+				}
+				b->send_max += fwd;
+				b->flags &= ~BF_OUT_EMPTY;
 			}
 
-			if (fdtab[fd].state == FD_STCONN)
+			if (fdtab[fd].state == FD_STCONN) {
 				fdtab[fd].state = FD_STREADY;
+				si->exp = TICK_ETERNITY;
+			}
 
 			b->flags |= BF_READ_PARTIAL;
-			b->flags &= ~BF_EMPTY;
 
-			if (b->r == b->data + BUFSIZE) {
+			if (b->r == b->data + b->size) {
 				b->r = b->data; /* wrap around the buffer */
 			}
 
 			b->total += ret;
 
-			if (b->l >= b->max_len) {
+			if (b->l >= buffer_max_len(b)) {
 				/* The buffer is now full, there's no point in going through
 				 * the loop again.
 				 */
@@ -354,7 +370,7 @@ int stream_sock_read(int fd) {
 					}
 				}
 				else if ((b->flags & (BF_STREAMER | BF_STREAMER_FAST)) &&
-					 (cur_read <= BUFSIZE / 2)) {
+					 (cur_read <= b->size / 2)) {
 					b->xfer_large = 0;
 					b->xfer_small++;
 					if (b->xfer_small >= 2) {
@@ -384,7 +400,7 @@ int stream_sock_read(int fd) {
 			 */
 			if (ret < max) {
 				if ((b->flags & (BF_STREAMER | BF_STREAMER_FAST)) &&
-				    (cur_read <= BUFSIZE / 2)) {
+				    (cur_read <= b->size / 2)) {
 					b->xfer_large = 0;
 					b->xfer_small++;
 					if (b->xfer_small >= 3) {
@@ -453,8 +469,14 @@ int stream_sock_read(int fd) {
 	} /* while (1) */
 
  out_wakeup:
-	/* We might have some data the consumer is waiting for */
-	if ((b->send_max || b->pipe) && (b->cons->flags & SI_FL_WAIT_DATA)) {
+	/* We might have some data the consumer is waiting for.
+	 * We can do fast-forwarding, but we avoid doing this for partial
+	 * buffers, because it is very likely that it will be done again
+	 * immediately afterwards once the following data is parsed (eg:
+	 * HTTP chunking).
+	 */
+	if ((b->pipe || b->send_max == b->l)
+	    && (b->cons->flags & SI_FL_WAIT_DATA)) {
 		int last_len = b->pipe ? b->pipe->data : 0;
 
 		b->cons->chk_snd(b->cons);
@@ -469,7 +491,7 @@ int stream_sock_read(int fd) {
 		EV_FD_CLR(fd, DIR_RD);
 		b->rex = TICK_ETERNITY;
 	}
-	else if ((b->flags & (BF_SHUTR|BF_READ_PARTIAL|BF_FULL|BF_READ_NOEXP)) == BF_READ_PARTIAL)
+	else if ((b->flags & (BF_SHUTR|BF_READ_PARTIAL|BF_FULL|BF_DONT_READ|BF_READ_NOEXP)) == BF_READ_PARTIAL)
 		b->rex = tick_add_ifset(now_ms, b->rto);
 
 	/* we have to wake up if there is a special event or if we don't have
@@ -490,6 +512,8 @@ int stream_sock_read(int fd) {
 	/* we received a shutdown */
 	fdtab[fd].ev &= ~FD_POLL_HUP;
 	b->flags |= BF_READ_NULL;
+	if (b->flags & BF_AUTO_CLOSE)
+		buffer_shutw_now(b);
 	stream_sock_shutr(si);
 	goto out_wakeup;
 
@@ -552,13 +576,11 @@ static int stream_sock_write_loop(struct stream_interface *si, struct buffer *b)
 	/* At this point, the pipe is empty, but we may still have data pending
 	 * in the normal buffer.
 	 */
-	if (!b->l) {
-		b->flags |= BF_EMPTY;
+#endif
+	if (!b->send_max) {
+		b->flags |= BF_OUT_EMPTY;
 		return retval;
 	}
-#endif
-	if (!b->send_max)
-		return retval;
 
 	/* when we're in this loop, we already know that there is no spliced
 	 * data left, and that there are sendable buffered data.
@@ -567,14 +589,39 @@ static int stream_sock_write_loop(struct stream_interface *si, struct buffer *b)
 		if (b->r > b->w)
 			max = b->r - b->w;
 		else
-			max = b->data + BUFSIZE - b->w;
+			max = b->data + b->size - b->w;
 
 		/* limit the amount of outgoing data if required */
 		if (max > b->send_max)
 			max = b->send_max;
 
-		if (MSG_NOSIGNAL) {
-			ret = send(si->fd, b->w, max, MSG_DONTWAIT | MSG_NOSIGNAL);
+		/* check if we want to inform the kernel that we're interested in
+		 * sending more data after this call. We want this if :
+		 *  - we're about to close after this last send and want to merge
+		 *    the ongoing FIN with the last segment.
+		 *  - we know we can't send everything at once and must get back
+		 *    here because of unaligned data
+		 *  - there is still a finite amount of data to forward
+		 * The test is arranged so that the most common case does only 2
+		 * tests.
+		 */
+
+		if (MSG_NOSIGNAL && MSG_MORE) {
+			unsigned int send_flag = MSG_DONTWAIT | MSG_NOSIGNAL;
+
+			if ((!(b->flags & BF_NEVER_WAIT) &&
+			    ((b->to_forward && b->to_forward != BUF_INFINITE_FORWARD) ||
+			     (b->flags & BF_EXPECT_MORE))) ||
+			    ((b->flags & (BF_SHUTW|BF_SHUTW_NOW|BF_HIJACK)) == BF_SHUTW_NOW && (max == b->send_max)) ||
+			    (max != b->l && max != b->send_max)) {
+				send_flag |= MSG_MORE;
+			}
+
+			/* this flag has precedence over the rest */
+			if (b->flags & BF_SEND_DONTWAIT)
+				send_flag &= ~MSG_MORE;
+
+			ret = send(si->fd, b->w, max, send_flag);
 		} else {
 			int skerr;
 			socklen_t lskerr = sizeof(skerr);
@@ -587,29 +634,33 @@ static int stream_sock_write_loop(struct stream_interface *si, struct buffer *b)
 		}
 
 		if (ret > 0) {
-			if (fdtab[si->fd].state == FD_STCONN)
+			if (fdtab[si->fd].state == FD_STCONN) {
 				fdtab[si->fd].state = FD_STREADY;
+				si->exp = TICK_ETERNITY;
+			}
 
 			b->flags |= BF_WRITE_PARTIAL;
 
 			b->w += ret;
-			if (b->w == b->data + BUFSIZE)
+			if (b->w == b->data + b->size)
 				b->w = b->data; /* wrap around the buffer */
 
 			b->l -= ret;
-			if (likely(b->l < b->max_len))
+			if (likely(b->l < buffer_max_len(b)))
 				b->flags &= ~BF_FULL;
 
-			if (likely(!b->l)) {
+			if (likely(!b->l))
 				/* optimize data alignment in the buffer */
 				b->r = b->w = b->lr = b->data;
-				if (likely(!b->pipe))
-					b->flags |= BF_EMPTY;
-			}
 
 			b->send_max -= ret;
-			if (!b->send_max || !b->l)
+			if (!b->send_max) {
+				/* Always clear both flags once everything has been sent, they're one-shot */
+				b->flags &= ~(BF_EXPECT_MORE | BF_SEND_DONTWAIT);
+				if (likely(!b->pipe))
+					b->flags |= BF_OUT_EMPTY;
 				break;
+			}
 
 			/* if the system buffer is full, don't insist */
 			if (ret < max)
@@ -657,7 +708,7 @@ int stream_sock_write(int fd)
 	if (b->flags & BF_SHUTW)
 		goto out_wakeup;
 
-	if (likely(!(b->flags & BF_EMPTY))) {
+	if (likely(!(b->flags & BF_OUT_EMPTY))) {
 		/* OK there are data waiting to be sent */
 		retval = stream_sock_write_loop(si, b);
 		if (retval < 0)
@@ -675,7 +726,7 @@ int stream_sock_write(int fd)
 			 *  - connecting (EALREADY, EINPROGRESS)
 			 *  - connected (EISCONN, 0)
 			 */
-			if ((connect(fd, fdtab[fd].peeraddr, fdtab[fd].peerlen) == 0))
+			if ((connect(fd, fdinfo[fd].peeraddr, fdinfo[fd].peerlen) == 0))
 				errno = 0;
 
 			if (errno == EALREADY || errno == EINPROGRESS) {
@@ -691,6 +742,7 @@ int stream_sock_write(int fd)
 			 */
 			b->flags |= BF_WRITE_NULL;
 			fdtab[fd].state = FD_STREADY;
+			si->exp = TICK_ETERNITY;
 		}
 
 		/* Funny, we were called to write something but there wasn't
@@ -701,20 +753,19 @@ int stream_sock_write(int fd)
 		 */
 	}
 
-	if (!b->pipe && !b->send_max) {
+	if (b->flags & BF_OUT_EMPTY) {
 		/* the connection is established but we can't write. Either the
 		 * buffer is empty, or we just refrain from sending because the
 		 * send_max limit was reached. Maybe we just wrote the last
 		 * chunk and need to close.
 		 */
-		if (((b->flags & (BF_SHUTW|BF_EMPTY|BF_HIJACK|BF_WRITE_ENA|BF_SHUTR)) ==
-		     (BF_EMPTY|BF_WRITE_ENA|BF_SHUTR)) &&
+		if (((b->flags & (BF_SHUTW|BF_HIJACK|BF_SHUTW_NOW)) == BF_SHUTW_NOW) &&
 		    (si->state == SI_ST_EST)) {
 			stream_sock_shutw(si);
 			goto out_wakeup;
 		}
 		
-		if ((b->flags & (BF_EMPTY|BF_SHUTW)) == BF_EMPTY)
+		if ((b->flags & (BF_SHUTW|BF_SHUTW_NOW|BF_FULL|BF_HIJACK)) == 0)
 			si->flags |= SI_FL_WAIT_DATA;
 
 		EV_FD_CLR(fd, DIR_WR);
@@ -724,8 +775,7 @@ int stream_sock_write(int fd)
  out_may_wakeup:
 	if (b->flags & BF_WRITE_ACTIVITY) {
 		/* update timeout if we have written something */
-		if ((b->send_max || b->pipe) &&
-		    (b->flags & (BF_SHUTW|BF_WRITE_PARTIAL)) == BF_WRITE_PARTIAL)
+		if ((b->flags & (BF_OUT_EMPTY|BF_SHUTW|BF_WRITE_PARTIAL)) == BF_WRITE_PARTIAL)
 			b->wex = tick_add_ifset(now_ms, b->wto);
 
 	out_wakeup:
@@ -742,7 +792,7 @@ int stream_sock_write(int fd)
 		}
 
 		/* the producer might be waiting for more room to store data */
-		if (likely((b->flags & (BF_SHUTW|BF_WRITE_PARTIAL|BF_FULL)) == BF_WRITE_PARTIAL &&
+		if (likely((b->flags & (BF_SHUTW|BF_WRITE_PARTIAL|BF_FULL|BF_DONT_READ)) == BF_WRITE_PARTIAL &&
 			   (b->prod->flags & SI_FL_WAIT_ROOM)))
 			b->prod->chk_rcv(b->prod);
 
@@ -750,7 +800,7 @@ int stream_sock_write(int fd)
 		 * any more data to forward and it's not planned to send any more.
 		 */
 		if (likely((b->flags & (BF_WRITE_NULL|BF_WRITE_ERROR|BF_SHUTW)) ||
-			   (!b->to_forward && !b->send_max && !b->pipe) ||
+			   ((b->flags & BF_OUT_EMPTY) && !b->to_forward) ||
 			   si->state != SI_ST_EST ||
 			   b->prod->state != SI_ST_EST))
 			task_wakeup(si->owner, TASK_WOKEN_IO);
@@ -779,10 +829,12 @@ int stream_sock_write(int fd)
  * This function performs a shutdown-write on a stream interface in a connected or
  * init state (it does nothing for other states). It either shuts the write side
  * or closes the file descriptor and marks itself as closed. The buffer flags are
- * updated to reflect the new state.
+ * updated to reflect the new state. It does also close everything is the SI was
+ * marked as being in error state.
  */
 void stream_sock_shutw(struct stream_interface *si)
 {
+	si->ob->flags &= ~BF_SHUTW_NOW;
 	if (si->ob->flags & BF_SHUTW)
 		return;
 	si->ob->flags |= BF_SHUTW;
@@ -794,12 +846,23 @@ void stream_sock_shutw(struct stream_interface *si)
 		/* we have to shut before closing, otherwise some short messages
 		 * may never leave the system, especially when there are remaining
 		 * unread data in the socket input buffer, or when nolinger is set.
+		 * However, if SI_FL_NOLINGER is explicitly set, we know there is
+		 * no risk so we close both sides immediately.
 		 */
-		EV_FD_CLR(si->fd, DIR_WR);
-		shutdown(si->fd, SHUT_WR);
+		if (si->flags & SI_FL_ERR) {
+			/* quick close, the socket is already shut. Remove pending flags. */
+			si->flags &= ~SI_FL_NOLINGER;
+		} else if (si->flags & SI_FL_NOLINGER) {
+			si->flags &= ~SI_FL_NOLINGER;
+			setsockopt(si->fd, SOL_SOCKET, SO_LINGER,
+				   (struct linger *) &nolinger, sizeof(struct linger));
+		} else {
+			EV_FD_CLR(si->fd, DIR_WR);
+			shutdown(si->fd, SHUT_WR);
 
-		if (!(si->ib->flags & BF_SHUTR))
-			return;
+			if (!(si->ib->flags & (BF_SHUTR|BF_DONT_READ)))
+				return;
+		}
 
 		/* fall through */
 	case SI_ST_CON:
@@ -809,6 +872,8 @@ void stream_sock_shutw(struct stream_interface *si)
 		fd_delete(si->fd);
 		/* fall through */
 	case SI_ST_CER:
+	case SI_ST_QUE:
+	case SI_ST_TAR:
 		si->state = SI_ST_DIS;
 	default:
 		si->flags &= ~SI_FL_WAIT_ROOM;
@@ -827,6 +892,7 @@ void stream_sock_shutw(struct stream_interface *si)
  */
 void stream_sock_shutr(struct stream_interface *si)
 {
+	si->ib->flags &= ~BF_SHUTR_NOW;
 	if (si->ib->flags & BF_SHUTR)
 		return;
 	si->ib->flags |= BF_SHUTR;
@@ -869,9 +935,9 @@ void stream_sock_data_finish(struct stream_interface *si)
 	/* Check if we need to close the read side */
 	if (!(ib->flags & BF_SHUTR)) {
 		/* Read not closed, update FD status and timeout for reads */
-		if (ib->flags & (BF_FULL|BF_HIJACK)) {
+		if (ib->flags & (BF_FULL|BF_HIJACK|BF_DONT_READ)) {
 			/* stop reading */
-			if ((ib->flags & (BF_FULL|BF_HIJACK)) == BF_FULL)
+			if ((ib->flags & (BF_FULL|BF_HIJACK|BF_DONT_READ)) == BF_FULL)
 				si->flags |= SI_FL_WAIT_ROOM;
 			EV_FD_COND_C(fd, DIR_RD);
 			ib->rex = TICK_ETERNITY;
@@ -884,7 +950,7 @@ void stream_sock_data_finish(struct stream_interface *si)
 			 */
 			si->flags &= ~SI_FL_WAIT_ROOM;
 			EV_FD_COND_S(fd, DIR_RD);
-			if (!(ib->flags & BF_READ_NOEXP) && !tick_isset(ib->rex))
+			if (!(ib->flags & (BF_READ_NOEXP|BF_DONT_READ)) && !tick_isset(ib->rex))
 				ib->rex = tick_add_ifset(now_ms, ib->rto);
 		}
 	}
@@ -892,11 +958,9 @@ void stream_sock_data_finish(struct stream_interface *si)
 	/* Check if we need to close the write side */
 	if (!(ob->flags & BF_SHUTW)) {
 		/* Write not closed, update FD status and timeout for writes */
-		if ((ob->send_max == 0 && !ob->pipe) ||
-		    (ob->flags & BF_EMPTY) ||
-		    (ob->flags & (BF_HIJACK|BF_WRITE_ENA)) == 0) {
+		if (ob->flags & BF_OUT_EMPTY) {
 			/* stop writing */
-			if ((ob->flags & (BF_EMPTY|BF_HIJACK|BF_WRITE_ENA)) == (BF_EMPTY|BF_WRITE_ENA))
+			if ((ob->flags & (BF_FULL|BF_HIJACK|BF_SHUTW_NOW)) == 0)
 				si->flags |= SI_FL_WAIT_DATA;
 			EV_FD_COND_C(fd, DIR_WR);
 			ob->wex = TICK_ETERNITY;
@@ -945,9 +1009,9 @@ void stream_sock_chk_rcv(struct stream_interface *si)
 	if (unlikely(si->state != SI_ST_EST || (ib->flags & BF_SHUTR)))
 		return;
 
-	if (ib->flags & (BF_FULL|BF_HIJACK)) {
+	if (ib->flags & (BF_FULL|BF_HIJACK|BF_DONT_READ)) {
 		/* stop reading */
-		if ((ib->flags & (BF_FULL|BF_HIJACK)) == BF_FULL)
+		if ((ib->flags & (BF_FULL|BF_HIJACK|BF_DONT_READ)) == BF_FULL)
 			si->flags |= SI_FL_WAIT_ROOM;
 		EV_FD_COND_C(si->fd, DIR_RD);
 	}
@@ -982,8 +1046,7 @@ void stream_sock_chk_snd(struct stream_interface *si)
 
 	if (!(si->flags & SI_FL_WAIT_DATA) ||        /* not waiting for data */
 	    (fdtab[si->fd].ev & FD_POLL_OUT) ||      /* we'll be called anyway */
-	    !(ob->send_max || ob->pipe) ||           /* called with nothing to send ! */
-	    !(ob->flags & (BF_HIJACK|BF_WRITE_ENA))) /* we may not write */
+	    (ob->flags & BF_OUT_EMPTY))              /* called with nothing to send ! */
 		return;
 
 	retval = stream_sock_write_loop(si, ob);
@@ -1007,20 +1070,20 @@ void stream_sock_chk_snd(struct stream_interface *si)
 	 * been sent, and that we may have to poll first. We have to do that
 	 * too if the buffer is not empty.
 	 */
-	if (ob->send_max == 0 && !ob->pipe) {
+	if (ob->flags & BF_OUT_EMPTY) {
 		/* the connection is established but we can't write. Either the
 		 * buffer is empty, or we just refrain from sending because the
 		 * send_max limit was reached. Maybe we just wrote the last
 		 * chunk and need to close.
 		 */
-		if (((ob->flags & (BF_SHUTW|BF_EMPTY|BF_HIJACK|BF_WRITE_ENA|BF_SHUTR)) ==
-		     (BF_EMPTY|BF_WRITE_ENA|BF_SHUTR)) &&
+		if (((ob->flags & (BF_SHUTW|BF_HIJACK|BF_AUTO_CLOSE|BF_SHUTW_NOW)) ==
+		     (BF_AUTO_CLOSE|BF_SHUTW_NOW)) &&
 		    (si->state == SI_ST_EST)) {
 			stream_sock_shutw(si);
 			goto out_wakeup;
 		}
 
-		if ((ob->flags & (BF_SHUTW|BF_EMPTY|BF_HIJACK|BF_WRITE_ENA)) == (BF_EMPTY|BF_WRITE_ENA))
+		if ((ob->flags & (BF_SHUTW|BF_SHUTW_NOW|BF_FULL|BF_HIJACK)) == 0)
 			si->flags |= SI_FL_WAIT_DATA;
 		ob->wex = TICK_ETERNITY;
 	}
@@ -1036,8 +1099,7 @@ void stream_sock_chk_snd(struct stream_interface *si)
 
 	if (likely(ob->flags & BF_WRITE_ACTIVITY)) {
 		/* update timeout if we have written something */
-		if ((ob->send_max || ob->pipe) &&
-		    (ob->flags & (BF_SHUTW|BF_WRITE_PARTIAL)) == BF_WRITE_PARTIAL)
+		if ((ob->flags & (BF_OUT_EMPTY|BF_SHUTW|BF_WRITE_PARTIAL)) == BF_WRITE_PARTIAL)
 			ob->wex = tick_add_ifset(now_ms, ob->wto);
 
 		if (tick_isset(si->ib->rex) && !(si->flags & SI_FL_INDEP_STR)) {
@@ -1057,10 +1119,11 @@ void stream_sock_chk_snd(struct stream_interface *si)
 	 * have to notify the task.
 	 */
 	if (likely((ob->flags & (BF_WRITE_NULL|BF_WRITE_ERROR|BF_SHUTW)) ||
-		   (!ob->to_forward && !ob->send_max && !ob->pipe) ||
+		   ((ob->flags & BF_OUT_EMPTY) && !ob->to_forward) ||
 		   si->state != SI_ST_EST)) {
 	out_wakeup:
-		task_wakeup(si->owner, TASK_WOKEN_IO);
+		if (!(si->flags & SI_FL_DONT_WAKE) && si->owner)
+			task_wakeup(si->owner, TASK_WOKEN_IO);
 	}
 }
 

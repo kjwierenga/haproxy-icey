@@ -1,7 +1,7 @@
 /*
  * Elastic Binary Trees - macros and structures for operations on 64bit nodes.
- * Version 4.0
- * (C) 2002-2008 - Willy Tarreau <w@1wt.eu>
+ * Version 6.0
+ * (C) 2002-2010 - Willy Tarreau <w@1wt.eu>
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -18,8 +18,8 @@
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
  */
 
-#ifndef _COMMON_EB64TREE_H
-#define _COMMON_EB64TREE_H
+#ifndef _EB64TREE_H
+#define _EB64TREE_H
 
 #include "ebtree.h"
 
@@ -100,6 +100,8 @@ static inline void eb64_delete(struct eb64_node *eb64)
  */
 REGPRM2 struct eb64_node *eb64_lookup(struct eb_root *root, u64 x);
 REGPRM2 struct eb64_node *eb64i_lookup(struct eb_root *root, s64 x);
+REGPRM2 struct eb64_node *eb64_lookup_le(struct eb_root *root, u64 x);
+REGPRM2 struct eb64_node *eb64_lookup_ge(struct eb_root *root, u64 x);
 REGPRM2 struct eb64_node *eb64_insert(struct eb_root *root, struct eb64_node *new);
 REGPRM2 struct eb64_node *eb64i_insert(struct eb_root *root, struct eb64_node *new);
 
@@ -182,7 +184,7 @@ static forceinline struct eb64_node *__eb64i_lookup(struct eb_root *root, s64 x)
 		if ((eb_gettag(troot) == EB_LEAF)) {
 			node = container_of(eb_untag(troot, EB_LEAF),
 					    struct eb64_node, node.branches);
-			if (node->key == x)
+			if (node->key == (u64)x)
 				return node;
 			else
 				return NULL;
@@ -223,7 +225,8 @@ __eb64_insert(struct eb_root *root, struct eb64_node *new) {
 	unsigned int side;
 	eb_troot_t *troot;
 	u64 newkey; /* caching the key saves approximately one cycle */
-	eb_troot_t *root_right = root;
+	eb_troot_t *root_right;
+	int old_node_bit;
 
 	side = EB_LEFT;
 	troot = root->b[EB_LEFT];
@@ -310,14 +313,15 @@ __eb64_insert(struct eb_root *root, struct eb64_node *new) {
 		/* OK we're walking down this link */
 		old = container_of(eb_untag(troot, EB_NODE),
 				    struct eb64_node, node.branches);
+		old_node_bit = old->node.bit;
 
 		/* Stop going down when we don't have common bits anymore. We
 		 * also stop in front of a duplicates tree because it means we
 		 * have to insert above.
 		 */
 
-		if ((old->node.bit < 0) || /* we're above a duplicate tree, stop here */
-		    (((new->key ^ old->key) >> old->node.bit) >= EB_NODE_BRANCHES)) {
+		if ((old_node_bit < 0) || /* we're above a duplicate tree, stop here */
+		    (((new->key ^ old->key) >> old_node_bit) >= EB_NODE_BRANCHES)) {
 			/* The tree did not contain the key, so we insert <new> before the node
 			 * <old>, and set ->bit to designate the lowest bit position in <new>
 			 * which applies to ->branches.b[].
@@ -355,13 +359,13 @@ __eb64_insert(struct eb_root *root, struct eb64_node *new) {
 		/* walk down */
 		root = &old->node.branches;
 #if BITS_PER_LONG >= 64
-		side = (newkey >> old->node.bit) & EB_NODE_BRANCH_MASK;
+		side = (newkey >> old_node_bit) & EB_NODE_BRANCH_MASK;
 #else
 		side = newkey;
-		side >>= old->node.bit;
-		if (old->node.bit >= 32) {
+		side >>= old_node_bit;
+		if (old_node_bit >= 32) {
 			side = newkey >> 32;
-			side >>= old->node.bit & 0x1F;
+			side >>= old_node_bit & 0x1F;
 		}
 		side &= EB_NODE_BRANCH_MASK;
 #endif
@@ -397,7 +401,8 @@ __eb64i_insert(struct eb_root *root, struct eb64_node *new) {
 	unsigned int side;
 	eb_troot_t *troot;
 	u64 newkey; /* caching the key saves approximately one cycle */
-	eb_troot_t *root_right = root;
+	eb_troot_t *root_right;
+	int old_node_bit;
 
 	side = EB_LEFT;
 	troot = root->b[EB_LEFT];
@@ -486,14 +491,15 @@ __eb64i_insert(struct eb_root *root, struct eb64_node *new) {
 		/* OK we're walking down this link */
 		old = container_of(eb_untag(troot, EB_NODE),
 				    struct eb64_node, node.branches);
+		old_node_bit = old->node.bit;
 
 		/* Stop going down when we don't have common bits anymore. We
 		 * also stop in front of a duplicates tree because it means we
 		 * have to insert above.
 		 */
 
-		if ((old->node.bit < 0) || /* we're above a duplicate tree, stop here */
-		    (((new->key ^ old->key) >> old->node.bit) >= EB_NODE_BRANCHES)) {
+		if ((old_node_bit < 0) || /* we're above a duplicate tree, stop here */
+		    (((new->key ^ old->key) >> old_node_bit) >= EB_NODE_BRANCHES)) {
 			/* The tree did not contain the key, so we insert <new> before the node
 			 * <old>, and set ->bit to designate the lowest bit position in <new>
 			 * which applies to ->branches.b[].
@@ -531,13 +537,13 @@ __eb64i_insert(struct eb_root *root, struct eb64_node *new) {
 		/* walk down */
 		root = &old->node.branches;
 #if BITS_PER_LONG >= 64
-		side = (newkey >> old->node.bit) & EB_NODE_BRANCH_MASK;
+		side = (newkey >> old_node_bit) & EB_NODE_BRANCH_MASK;
 #else
 		side = newkey;
-		side >>= old->node.bit;
-		if (old->node.bit >= 32) {
+		side >>= old_node_bit;
+		if (old_node_bit >= 32) {
 			side = newkey >> 32;
-			side >>= old->node.bit & 0x1F;
+			side >>= old_node_bit & 0x1F;
 		}
 		side &= EB_NODE_BRANCH_MASK;
 #endif
@@ -563,4 +569,4 @@ __eb64i_insert(struct eb_root *root, struct eb64_node *new) {
 	return new;
 }
 
-#endif /* _COMMON_EB64TREE_H */
+#endif /* _EB64_TREE_H */

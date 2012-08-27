@@ -1,23 +1,23 @@
 /*
-  include/proto/acl.h
-  This file provides interface definitions for ACL manipulation.
-
-  Copyright (C) 2000-2008 Willy Tarreau - w@1wt.eu
-
-  This library is free software; you can redistribute it and/or
-  modify it under the terms of the GNU Lesser General Public
-  License as published by the Free Software Foundation, version 2.1
-  exclusively.
-
-  This library is distributed in the hope that it will be useful,
-  but WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public
-  License along with this library; if not, write to the Free Software
-  Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
-*/
+ * include/proto/acl.h
+ * This file provides interface definitions for ACL manipulation.
+ *
+ * Copyright (C) 2000-2011 Willy Tarreau - w@1wt.eu
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation, version 2.1
+ * exclusively.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
+ */
 
 #ifndef _PROTO_ACL_H
 #define _PROTO_ACL_H
@@ -80,6 +80,14 @@ struct acl_cond *prune_acl_cond(struct acl_cond *cond);
  */
 struct acl_cond *parse_acl_cond(const char **args, struct list *known_acl, int pol);
 
+/* Builds an ACL condition starting at the if/unless keyword. The complete
+ * condition is returned. NULL is returned in case of error or if the first
+ * word is neither "if" nor "unless". It automatically sets the file name and
+ * the line number in the condition for better error reporting, and adds the
+ * ACL requirements to the proxy's acl_requires.
+ */
+struct acl_cond *build_acl_cond(const char *file, int line, struct proxy *px, const char **args);
+
 /* Execute condition <cond> and return either ACL_PAT_FAIL, ACL_PAT_MISS or
  * ACL_PAT_PASS depending on the test results. This function only computes the
  * condition, it does not apply the polarity required by IF/UNLESS, it's up to
@@ -90,7 +98,13 @@ int acl_exec_cond(struct acl_cond *cond, struct proxy *px, struct session *l4, v
 /* Reports a pointer to the first ACL used in condition <cond> which requires
  * at least one of the USE_FLAGS in <require>. Returns NULL if none matches.
  */
-struct acl *cond_find_require(struct acl_cond *cond, unsigned int require);
+struct acl *cond_find_require(const struct acl_cond *cond, unsigned int require);
+
+/*
+ * Find targets for userlist and groups in acl. Function returns the number
+ * of errors or OK if everything is fine.
+ */
+int acl_find_targets(struct proxy *p);
 
 /* Return a pointer to the ACL <name> within the list starting at <head>, or
  * NULL if not found.
@@ -122,6 +136,9 @@ int acl_parse_nothing(const char **text, struct acl_pattern *pattern, int *opaqu
 /* NB: For two strings to be identical, it is required that their lengths match */
 int acl_match_str(struct acl_test *test, struct acl_pattern *pattern);
 
+/* Checks that the length of the pattern in <test> is included between min and max */
+int acl_match_len(struct acl_test *test, struct acl_pattern *pattern);
+
 /* Checks that the integer in <test> is included between min and max */
 int acl_match_int(struct acl_test *test, struct acl_pattern *pattern);
 
@@ -138,6 +155,9 @@ int acl_parse_range(const char **text, struct acl_pattern *pattern, int *opaque)
 
 /* Parse a string. It is allocated and duplicated. */
 int acl_parse_str(const char **text, struct acl_pattern *pattern, int *opaque);
+
+/* Parse and concatenate strings into one. It is allocated and duplicated. */
+int acl_parse_strcat(const char **text, struct acl_pattern *pattern, int *opaque);
 
 /* Parse a regex. It is allocated. */
 int acl_parse_reg(const char **text, struct acl_pattern *pattern, int *opaque);

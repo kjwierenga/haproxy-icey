@@ -1,11 +1,11 @@
 Summary: HA-Proxy is a TCP/HTTP reverse proxy for high availability environments
 Name: haproxy
-Version: 1.3.22
+Version: 1.4.21
 Release: 1
 License: GPL
 Group: System Environment/Daemons
 URL: http://haproxy.1wt.eu/
-Source0: http://haproxy.1wt.eu/download/1.3/src/%{name}-%{version}.tar.gz
+Source0: http://haproxy.1wt.eu/download/1.4/src/%{name}-%{version}.tar.gz
 BuildRoot: %{_tmppath}/%{name}-%{version}-root
 BuildRequires: pcre-devel
 Requires: /sbin/chkconfig, /sbin/service
@@ -76,17 +76,101 @@ fi
 %attr(0755,root,root) %config %{_sysconfdir}/rc.d/init.d/%{name}
 
 %changelog
-* Wed Oct 14 2009 Willy Tarreau <w@1wt.eu>
-- updated to 1.3.22
+* Mon May 21 2012 Willy Tarreau <w@1wt.eu>
+- updated to 1.4.21
+
+* Sat Mar 10 2012 Willy Tarreau <w@1wt.eu>
+- updated to 1.4.20
+
+* Sun Jan  8 2012 Willy Tarreau <w@1wt.eu>
+- updated to 1.4.19
+
+* Fri Sep 16 2011 Willy Tarreau <w@1wt.eu>
+- updated to 1.4.18
+
+* Mon Sep  5 2011 Willy Tarreau <w@1wt.eu>
+- updated to 1.4.17
+
+* Thu Aug  4 2011 Willy Tarreau <w@1wt.eu>
+- updated to 1.4.16
+
+* Fri Apr  8 2011 Willy Tarreau <w@1wt.eu>
+- updated to 1.4.15
+
+* Tue Mar 29 2011 Willy Tarreau <w@1wt.eu>
+- updated to 1.4.14
+
+* Wed Mar  9 2011 Willy Tarreau <w@1wt.eu>
+- updated to 1.4.13
+
+* Tue Mar  8 2011 Willy Tarreau <w@1wt.eu>
+- updated to 1.4.12
+
+* Thu Feb 10 2011 Willy Tarreau <w@1wt.eu>
+- updated to 1.4.11
+
+* Mon Nov 29 2010 Willy Tarreau <w@1wt.eu>
+- updated to 1.4.10
+
+* Fri Oct 29 2010 Willy Tarreau <w@1wt.eu>
+- updated to 1.4.9
+
+* Wed Jun 16 2010 Willy Tarreau <w@1wt.eu>
+- updated to 1.4.8
+
+* Mon Jun  7 2010 Willy Tarreau <w@1wt.eu>
+- updated to 1.4.7
+
+* Sun May 16 2010 Willy Tarreau <w@1wt.eu>
+- updated to 1.4.6
+
+* Thu May 13 2010 Willy Tarreau <w@1wt.eu>
+- updated to 1.4.5
+
+* Wed Apr  7 2010 Willy Tarreau <w@1wt.eu>
+- updated to 1.4.4
+
+* Tue Mar 30 2010 Willy Tarreau <w@1wt.eu>
+- updated to 1.4.3
+
+* Wed Mar 17 2010 Willy Tarreau <w@1wt.eu>
+- updated to 1.4.2
+
+* Thu Mar  4 2010 Willy Tarreau <w@1wt.eu>
+- updated to 1.4.1
+
+* Fri Feb 26 2010 Willy Tarreau <w@1wt.eu>
+- updated to 1.4.0
+
+* Tue Feb  2 2010 Willy Tarreau <w@1wt.eu>
+- updated to 1.4-rc1
+
+* Mon Jan 25 2010 Willy Tarreau <w@1wt.eu>
+- updated to 1.4-dev8
+
+* Mon Jan 25 2010 Willy Tarreau <w@1wt.eu>
+- updated to 1.4-dev7
+
+* Fri Jan  8 2010 Willy Tarreau <w@1wt.eu>
+- updated to 1.4-dev6
+
+* Sun Jan  3 2010 Willy Tarreau <w@1wt.eu>
+- updated to 1.4-dev5
 
 * Mon Oct 12 2009 Willy Tarreau <w@1wt.eu>
-- updated to 1.3.21
+- updated to 1.4-dev4
+
+* Thu Sep 24 2009 Willy Tarreau <w@1wt.eu>
+- updated to 1.4-dev3
 
 * Sun Aug  9 2009 Willy Tarreau <w@1wt.eu>
-- updated to 1.3.20
+- updated to 1.4-dev2
 
-* Mon Jul 27 2009 Willy Tarreau <w@1wt.eu>
-- updated to 1.3.19
+* Wed Jul 29 2009 Willy Tarreau <w@1wt.eu>
+- updated to 1.4-dev1
+
+* Tue Jun 09 2009 Willy Tarreau <w@1wt.eu>
+- updated to 1.4-dev0
 
 * Sun May 10 2009 Willy Tarreau <w@1wt.eu>
 - updated to 1.3.18

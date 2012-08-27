@@ -1,23 +1,23 @@
 /*
-  include/types/acl.h
-  This file provides structures and types for ACLs.
-
-  Copyright (C) 2000-2008 Willy Tarreau - w@1wt.eu
-
-  This library is free software; you can redistribute it and/or
-  modify it under the terms of the GNU Lesser General Public
-  License as published by the Free Software Foundation, version 2.1
-  exclusively.
-
-  This library is distributed in the hope that it will be useful,
-  but WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public
-  License along with this library; if not, write to the Free Software
-  Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
-*/
+ * include/types/acl.h
+ * This file provides structures and types for ACLs.
+ *
+ * Copyright (C) 2000-2010 Willy Tarreau - w@1wt.eu
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation, version 2.1
+ * exclusively.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
+ */
 
 #ifndef _TYPES_ACL_H
 #define _TYPES_ACL_H
@@ -26,9 +26,12 @@
 #include <common/config.h>
 #include <common/mini-clist.h>
 
+#include <types/auth.h>
 #include <types/proxy.h>
+#include <types/server.h>
 #include <types/session.h>
 
+#include <ebmbtree.h>
 
 /* Pattern matching function result.
  *
@@ -84,6 +87,7 @@ enum {
 	ACL_TEST_F_RES_PASS   = 1 << 10,/* with SET_RESULT, sets result to PASS (defaults to FAIL) */
 	ACL_TEST_F_SET_RES_PASS = (ACL_TEST_F_RES_SET|ACL_TEST_F_RES_PASS),  /* sets result to PASS */
 	ACL_TEST_F_SET_RES_FAIL = (ACL_TEST_F_RES_SET),                      /* sets result to FAIL */
+	ACL_TEST_F_NULL_MATCH = 1 << 11,/* call expr->kw->match with NULL pattern if expr->patterns is empty */
 };
 
 /* ACLs can be evaluated on requests and on responses, and on partial or complete data */
@@ -98,6 +102,8 @@ enum {
 enum {
 	ACL_PAT_F_IGNORE_CASE = 1 << 0,       /* ignore case */
 	ACL_PAT_F_FROM_FILE   = 1 << 1,       /* pattern comes from a file */
+	ACL_PAT_F_TREE_OK     = 1 << 2,       /* the pattern parser is allowed to build a tree */
+	ACL_PAT_F_TREE        = 1 << 3,       /* some patterns are arranged in a tree */
 };
 
 /* what capabilities an ACL uses. These flags are set during parsing, which
@@ -163,6 +169,12 @@ enum {
 
 	/* any type of response information */
 	ACL_USE_RTR_ANY         = (ACL_USE_L4RTR_ANY | ACL_USE_L7RTR_ANY),
+
+	/* some flags indicating if a keyword supports exact pattern matching,
+	 * so that patterns may be arranged in lookup trees. Let's put those
+	 * flags at the end to leave some space for the other ones above.
+	 */
+	ACL_MAY_LOOKUP          =  1 << 31,  /* exact pattern lookup */
 };
 
 /* filtering hooks */
@@ -208,6 +220,8 @@ struct acl_pattern {
 			struct in_addr mask;
 		} ipv4;                         /* IPv4 address */
 		struct acl_time time;           /* valid hours and days */
+		unsigned int group_mask;
+		struct eb_root *tree;           /* tree storing all values if any */
 	} val;                                  /* direct value */
 	union {
 		void *ptr;              /* any data */
@@ -290,9 +304,12 @@ struct acl_expr {
 	struct acl_keyword *kw;     /* back-reference to the keyword */
 	union {                     /* optional argument of the subject (eg: header or cookie name) */
 		char *str;
+		struct userlist *ul;
+		struct server *srv;
 	} arg;
 	int arg_len;                /* optional argument length */
 	struct list patterns;       /* list of acl_patterns */
+	struct eb_root pattern_tree;  /* may be used for lookup in large datasets */
 };
 
 struct acl {
@@ -320,6 +337,7 @@ struct acl_cond {
 	struct list suites;         /* list of acl_term_suites */
 	int pol;                    /* polarity: ACL_COND_IF / ACL_COND_UNLESS */
 	unsigned int requires;      /* or'ed bit mask of all acl's ACL_USE_* */
+	const char *file;           /* config file where the condition is declared */
 	int line;                   /* line in the config file where the condition is declared */
 };
 

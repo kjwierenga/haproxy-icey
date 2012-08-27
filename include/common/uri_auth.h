@@ -15,12 +15,7 @@
 
 #include <common/config.h>
 
-/* here we find a very basic list of base64-encoded 'user:passwd' strings */
-struct user_auth {
-	struct user_auth *next;		/* next entry, NULL if none */
-	int user_len;			/* user:passwd length */
-	char *user_pwd;			/* auth as base64("user":"passwd") (see RFC2617) */
-};
+#include <types/auth.h>
 
 /* This is a list of proxies we are allowed to see. Later, it should go in the
  * user list, but before this we need to support de/re-authentication.
@@ -34,6 +29,8 @@ struct stat_scope {
 #define	ST_HIDEVER	0x00000001	/* do not report the version and reldate */
 #define	ST_SHNODE	0x00000002	/* show node name */
 #define	ST_SHDESC	0x00000004	/* show description */
+#define	ST_SHLGNDS	0x00000008	/* show legends */
+#define	ST_CONVDONE	0x00000010	/* req_acl conversion done */
 
 /* later we may link them to support multiple URI matching */
 struct uri_auth {
@@ -43,8 +40,10 @@ struct uri_auth {
 	char *node, *desc;		/* node name & description reported in this stats */
 	int refresh;			/* refresh interval for the browser (in seconds) */
 	int flags;			/* some flags describing the statistics page */
-	struct user_auth *users;	/* linked list of valid user:passwd couples */
 	struct stat_scope *scope;	/* linked list of authorized proxies */
+	struct userlist *userlist;	/* private userlist to emulate legacy "stats auth user:password" */
+	struct list req_acl; 		/* http stats ACL: allow/deny/auth */
+	struct list admin_rules;	/* 'stats admin' rules (chained) */
 	struct uri_auth *next;		/* Used at deinit() to build a list of unique elements */
 };
 
@@ -61,6 +60,12 @@ struct uri_auth {
 #else
 #define STATS_DEFAULT_REALM "HAProxy Statistics"
 #endif
+
+
+struct stats_admin_rule {
+	struct list list;	/* list linked to from the proxy */
+	struct acl_cond *cond;	/* acl condition to meet */
+};
 
 
 /* Various functions used to set the fields during the configuration parsing.

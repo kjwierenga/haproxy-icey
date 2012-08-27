@@ -1,7 +1,7 @@
 /*
  * ACL management functions.
  *
- * Copyright 2000-2008 Willy Tarreau <w@1wt.eu>
+ * Copyright 2000-2011 Willy Tarreau <w@1wt.eu>
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License
@@ -17,9 +17,16 @@
 #include <common/config.h>
 #include <common/mini-clist.h>
 #include <common/standard.h>
+#include <common/uri_auth.h>
+
+#include <types/global.h>
 
 #include <proto/acl.h>
+#include <proto/auth.h>
 #include <proto/log.h>
+#include <proto/proxy.h>
+
+#include <ebsttree.h>
 
 /* The capabilities of filtering hooks describe the type of information
  * available to each of them.
@@ -126,6 +133,25 @@ int acl_match_str(struct acl_test *test, struct acl_pattern *pattern)
 	return ACL_PAT_FAIL;
 }
 
+/* Lookup a string in the expression's pattern tree. The node is returned if it
+ * exists, otherwise NULL.
+ */
+void *acl_lookup_str(struct acl_test *test, struct acl_expr *expr)
+{
+	/* data are stored in a tree */
+	struct ebmb_node *node;
+	char prev;
+
+	/* we may have to force a trailing zero on the test pattern */
+	prev = test->ptr[test->len];
+	if (prev)
+		test->ptr[test->len] = '\0';
+	node = ebst_lookup(&expr->pattern_tree, test->ptr);
+	if (prev)
+		test->ptr[test->len] = prev;
+	return node;
+}
+
 /* Executes a regex. It needs to change the data. If it is marked READ_ONLY
  * then it will be allocated and duplicated in place so that others may use
  * it later on. Note that this is embarrassing because we always try to avoid
@@ -225,12 +251,35 @@ int acl_match_sub(struct acl_test *test, struct acl_pattern *pattern)
 	return ACL_PAT_FAIL;
 }
 
+/* Background: Fast way to find a zero byte in a word
+ * http://graphics.stanford.edu/~seander/bithacks.html#ZeroInWord
+ * hasZeroByte = (v - 0x01010101UL) & ~v & 0x80808080UL;
+ *
+ * To look for 4 different byte values, xor the word with those bytes and
+ * then check for zero bytes:
+ *
+ * v = (((unsigned char)c * 0x1010101U) ^ delimiter)
+ * where <delimiter> is the 4 byte values to look for (as an uint)
+ * and <c> is the character that is being tested
+ */
+static inline unsigned int is_delimiter(unsigned char c, unsigned int mask)
+{
+	mask ^= (c * 0x01010101); /* propagate the char to all 4 bytes */
+	return (mask - 0x01010101) & ~mask & 0x80808080U;
+}
+
+static inline unsigned int make_4delim(unsigned char d1, unsigned char d2, unsigned char d3, unsigned char d4)
+{
+	return d1 << 24 | d2 << 16 | d3 << 8 | d4;
+}
+
 /* This one is used by other real functions. It checks that the pattern is
  * included inside the tested string, but enclosed between the specified
- * delimitor, or a '/' or a '?' or at the beginning or end of the string.
- * The delimitor is stripped at the beginning or end of the pattern.
+ * delimiters or at the beginning or end of the string. The delimiters are
+ * provided as an unsigned int made by make_4delim() and match up to 4 different
+ * delimiters. Delimiters are stripped at the beginning and end of the pattern.
  */
-static int match_word(struct acl_test *test, struct acl_pattern *pattern, char delim)
+static int match_word(struct acl_test *test, struct acl_pattern *pattern, unsigned int delimiters)
 {
 	int may_match, icase;
 	char *c, *end;
@@ -239,13 +288,13 @@ static int match_word(struct acl_test *test, struct acl_pattern *pattern, char d
 
 	pl = pattern->len;
 	ps = pattern->ptr.str;
-	while (pl > 0 && (*ps == delim || *ps == '/' || *ps == '?')) {
+
+	while (pl > 0 && is_delimiter(*ps, delimiters)) {
 		pl--;
 		ps++;
 	}
 
-	while (pl > 0 &&
-	       (ps[pl - 1] == delim || ps[pl - 1] == '/' || ps[pl - 1] == '?'))
+	while (pl > 0 && is_delimiter(ps[pl - 1], delimiters))
 		pl--;
 
 	if (pl > test->len)
@@ -255,7 +304,7 @@ static int match_word(struct acl_test *test, struct acl_pattern *pattern, char d
 	icase = pattern->flags & ACL_PAT_F_IGNORE_CASE;
 	end = test->ptr + test->len - pl;
 	for (c = test->ptr; c <= end; c++) {
-		if (*c == '/' || *c == delim || *c == '?') {
+		if (is_delimiter(*c, delimiters)) {
 			may_match = 1;
 			continue;
 		}
@@ -266,12 +315,12 @@ static int match_word(struct acl_test *test, struct acl_pattern *pattern, char d
 		if (icase) {
 			if ((tolower(*c) == tolower(*ps)) &&
 			    (strncasecmp(ps, c, pl) == 0) &&
-			    (c == end || c[pl] == '/' || c[pl] == delim || c[pl] == '?'))
+			    (c == end || is_delimiter(c[pl], delimiters)))
 				return ACL_PAT_PASS;
 		} else {
 			if ((*c == *ps) &&
 			    (strncmp(ps, c, pl) == 0) &&
-			    (c == end || c[pl] == '/' || c[pl] == delim || c[pl] == '?'))
+			    (c == end || is_delimiter(c[pl], delimiters)))
 				return ACL_PAT_PASS;
 		}
 		may_match = 0;
@@ -280,21 +329,21 @@ static int match_word(struct acl_test *test, struct acl_pattern *pattern, char d
 }
 
 /* Checks that the pattern is included inside the tested string, but enclosed
- * between slashes or at the beginning or end of the string. Slashes at the
- * beginning or end of the pattern are ignored.
+ * between the delimiters '?' or '/' or at the beginning or end of the string.
+ * Delimiters at the beginning or end of the pattern are ignored.
  */
 int acl_match_dir(struct acl_test *test, struct acl_pattern *pattern)
 {
-	return match_word(test, pattern, '/');
+	return match_word(test, pattern, make_4delim('/', '?', '?', '?'));
 }
 
 /* Checks that the pattern is included inside the tested string, but enclosed
- * between dots or at the beginning or end of the string. Dots at the beginning
- * or end of the pattern are ignored.
+ * between the delmiters '/', '?', '.' or ":" or at the beginning or end of
+ * the string. Delimiters at the beginning or end of the pattern are ignored.
  */
 int acl_match_dom(struct acl_test *test, struct acl_pattern *pattern)
 {
-	return match_word(test, pattern, '.');
+	return match_word(test, pattern, make_4delim('/', '?', '.', ':'));
 }
 
 /* Checks that the integer in <test> is included between min and max */
@@ -302,6 +351,15 @@ int acl_match_int(struct acl_test *test, struct acl_pattern *pattern)
 {
 	if ((!pattern->val.range.min_set || pattern->val.range.min <= test->i) &&
 	    (!pattern->val.range.max_set || test->i <= pattern->val.range.max))
+		return ACL_PAT_PASS;
+	return ACL_PAT_FAIL;
+}
+
+/* Checks that the length of the pattern in <test> is included between min and max */
+int acl_match_len(struct acl_test *test, struct acl_pattern *pattern)
+{
+	if ((!pattern->val.range.min_set || pattern->val.range.min <= test->len) &&
+	    (!pattern->val.range.max_set || test->len <= pattern->val.range.max))
 		return ACL_PAT_PASS;
 	return ACL_PAT_FAIL;
 }
@@ -319,17 +377,72 @@ int acl_match_ip(struct acl_test *test, struct acl_pattern *pattern)
 	return ACL_PAT_FAIL;
 }
 
+/* Lookup an IPv4 address in the expression's pattern tree using the longest
+ * match method. The node is returned if it exists, otherwise NULL.
+ */
+void *acl_lookup_ip(struct acl_test *test, struct acl_expr *expr)
+{
+	struct in_addr *s;
+
+	if (test->i != AF_INET)
+		return ACL_PAT_FAIL;
+
+	s = (void *)test->ptr;
+
+	return ebmb_lookup_longest(&expr->pattern_tree, &s->s_addr);
+}
+
 /* Parse a string. It is allocated and duplicated. */
 int acl_parse_str(const char **text, struct acl_pattern *pattern, int *opaque)
 {
 	int len;
 
 	len  = strlen(*text);
+
+	if (pattern->flags & ACL_PAT_F_TREE_OK) {
+		/* we're allowed to put the data in a tree whose root is pointed
+		 * to by val.tree.
+		 */
+		struct ebmb_node *node;
+
+		node = calloc(1, sizeof(*node) + len + 1);
+		if (!node)
+			return 0;
+		memcpy(node->key, *text, len + 1);
+		if (ebst_insert(pattern->val.tree, node) != node)
+			free(node); /* was a duplicate */
+		pattern->flags |= ACL_PAT_F_TREE; /* this pattern now contains a tree */
+		return 1;
+	}
+
 	pattern->ptr.str = strdup(*text);
 	if (!pattern->ptr.str)
 		return 0;
 	pattern->len = len;
 	return 1;
+}
+
+/* Parse and concatenate all further strings into one. */
+int
+acl_parse_strcat(const char **text, struct acl_pattern *pattern, int *opaque)
+{
+
+	int len = 0, i;
+	char *s;
+
+	for (i = 0; *text[i]; i++)
+		len += strlen(text[i])+1;
+
+	pattern->ptr.str = s = calloc(1, len);
+	if (!pattern->ptr.str)
+		return 0;
+
+	for (i = 0; *text[i]; i++)
+		s += sprintf(s, i?" %s":"%s", text[i]);
+
+	pattern->len = len;
+
+	return i;
 }
 
 /* Free data allocated by acl_parse_reg */
@@ -543,8 +656,33 @@ int acl_parse_dotted_ver(const char **text, struct acl_pattern *pattern, int *op
  */
 int acl_parse_ip(const char **text, struct acl_pattern *pattern, int *opaque)
 {
-	if (str2net(*text, &pattern->val.ipv4.addr, &pattern->val.ipv4.mask))
+	struct eb_root *tree = NULL;
+	if (pattern->flags & ACL_PAT_F_TREE_OK)
+		tree = pattern->val.tree;
+
+	if (str2net(*text, &pattern->val.ipv4.addr, &pattern->val.ipv4.mask)) {
+		unsigned int mask = ntohl(pattern->val.ipv4.mask.s_addr);
+		struct ebmb_node *node;
+		/* check if the mask is contiguous so that we can insert the
+		 * network into the tree. A continuous mask has only ones on
+		 * the left. This means that this mask + its lower bit added
+		 * once again is null.
+		 */
+		if (mask + (mask & -mask) == 0 && tree) {
+			mask = mask ? 33 - flsnz(mask & -mask) : 0; /* equals cidr value */
+			/* FIXME: insert <addr>/<mask> into the tree here */
+			node = calloc(1, sizeof(*node) + 4); /* reserve 4 bytes for IPv4 address */
+			if (!node)
+				return 0;
+			memcpy(node->key, &pattern->val.ipv4.addr, 4); /* network byte order */
+			node->node.pfx = mask;
+			if (ebmb_insert_prefix(tree, node, 4) != node)
+				free(node); /* was a duplicate */
+			pattern->flags |= ACL_PAT_F_TREE;
+			return 1;
+		}
 		return 1;
+	}
 	else
 		return 0;
 }
@@ -603,8 +741,11 @@ struct acl_keyword *find_acl_kw(const char *kw)
 	return NULL;
 }
 
+/* NB: does nothing if <pat> is NULL */
 static void free_pattern(struct acl_pattern *pat)
 {
+	if (!pat)
+		return;
 
 	if (pat->ptr.ptr) {
 		if (pat->freeptrbuf)
@@ -623,14 +764,105 @@ static void free_pattern_list(struct list *head)
 		free_pattern(pat);
 }
 
+static void free_pattern_tree(struct eb_root *root)
+{
+	struct eb_node *node, *next;
+	node = eb_first(root);
+	while (node) {
+		next = eb_next(node);
+		free(node);
+		node = next;
+	}
+}
+
 static struct acl_expr *prune_acl_expr(struct acl_expr *expr)
 {
 	free_pattern_list(&expr->patterns);
+	free_pattern_tree(&expr->pattern_tree);
 	LIST_INIT(&expr->patterns);
-	if (expr->arg.str)
+	if (expr->arg_len && expr->arg.str)
 		free(expr->arg.str);
 	expr->kw->use_cnt--;
 	return expr;
+}
+
+static int acl_read_patterns_from_file(	struct acl_keyword *aclkw,
+					struct acl_expr *expr,
+					const char *filename, int patflags)
+{
+	FILE *file;
+	char *c;
+	const char *args[2];
+	struct acl_pattern *pattern;
+	int opaque;
+	int ret = 0;
+
+	file = fopen(filename, "r");
+	if (!file)
+		return 0;
+
+	/* now parse all patterns. The file may contain only one pattern per
+	 * line. If the line contains spaces, they will be part of the pattern.
+	 * The pattern stops at the first CR, LF or EOF encountered.
+	 */
+	opaque = 0;
+	pattern = NULL;
+	args[1] = "";
+	while (fgets(trash, trashlen, file) != NULL) {
+		c = trash;
+
+		/* ignore lines beginning with a dash */
+		if (*c == '#')
+			continue;
+
+		/* strip leading spaces and tabs */
+		while (*c == ' ' || *c == '\t')
+			c++;
+
+
+		args[0] = c;
+		while (*c && *c != '\n' && *c != '\r')
+			c++;
+		*c = 0;
+
+		/* empty lines are ignored too */
+		if (c == args[0])
+			continue;
+
+		/* we keep the previous pattern along iterations as long as it's not used */
+		if (!pattern)
+			pattern = (struct acl_pattern *)malloc(sizeof(*pattern));
+		if (!pattern)
+			goto out_close;
+
+		memset(pattern, 0, sizeof(*pattern));
+		pattern->flags = patflags;
+
+		if ((aclkw->requires & ACL_MAY_LOOKUP) && !(pattern->flags & ACL_PAT_F_IGNORE_CASE)) {
+			/* we pre-set the data pointer to the tree's head so that functions
+			 * which are able to insert in a tree know where to do that.
+			 */
+			pattern->flags |= ACL_PAT_F_TREE_OK;
+			pattern->val.tree = &expr->pattern_tree;
+		}
+
+		if (!aclkw->parse(args, pattern, &opaque))
+			goto out_free_pattern;
+
+		/* if the parser did not feed the tree, let's chain the pattern to the list */
+		if (!(pattern->flags & ACL_PAT_F_TREE)) {
+			LIST_ADDQ(&expr->patterns, &pattern->list);
+			pattern = NULL; /* get a new one */
+		}
+	}
+
+	ret = 1; /* success */
+
+ out_free_pattern:
+	free_pattern(pattern);
+ out_close:
+	fclose(file);
+	return ret;
 }
 
 /* Parse an ACL expression starting at <args>[0], and return it.
@@ -657,6 +889,7 @@ struct acl_expr *parse_acl_expr(const char **args)
 	expr->kw = aclkw;
 	aclkw->use_cnt++;
 	LIST_INIT(&expr->patterns);
+	expr->pattern_tree = EB_ROOT_UNIQUE;
 	expr->arg.str = NULL;
 	expr->arg_len = 0;
 
@@ -668,11 +901,9 @@ struct acl_expr *parse_acl_expr(const char **args)
 		end = strchr(arg, ')');
 		if (!end)
 			goto out_free_expr;
-		arg2 = (char *)calloc(1, end - arg + 1);
+		arg2 = my_strndup(arg, end - arg);
 		if (!arg2)
 			goto out_free_expr;
-		memcpy(arg2, arg, end - arg);
-		arg2[end-arg] = '\0';
 		expr->arg_len = end - arg;
 		expr->arg.str = arg2;
 	}
@@ -688,8 +919,11 @@ struct acl_expr *parse_acl_expr(const char **args)
 	while (**args == '-') {
 		if ((*args)[1] == 'i')
 			patflags |= ACL_PAT_F_IGNORE_CASE;
-		else if ((*args)[1] == 'f')
-			patflags |= ACL_PAT_F_FROM_FILE;
+		else if ((*args)[1] == 'f') {
+			if (!acl_read_patterns_from_file(aclkw, expr, args[1], patflags | ACL_PAT_F_FROM_FILE))
+				goto out_free_expr;
+			args++;
+		}
 		else if ((*args)[1] == '-') {
 			args++;
 			break;
@@ -744,7 +978,8 @@ struct acl *prune_acl(struct acl *acl) {
 
 /* Parse an ACL with the name starting at <args>[0], and with a list of already
  * known ACLs in <acl>. If the ACL was not in the list, it will be added.
- * A pointer to that ACL is returned.
+ * A pointer to that ACL is returned. If the ACL has an empty name, then it's
+ * an anonymous one and it won't be merged with any other one.
  *
  * args syntax: <aclname> <acl_expr>
  */
@@ -755,7 +990,7 @@ struct acl *parse_acl(const char **args, struct list *known_acl)
 	struct acl_expr *acl_expr;
 	char *name;
 
-	if (invalid_char(*args))
+	if (**args && invalid_char(*args))
 		goto out_return;
 
 	acl_expr = parse_acl_expr(args + 1);
@@ -774,7 +1009,11 @@ struct acl *parse_acl(const char **args, struct list *known_acl)
 			"  match and the pattern to make this warning message disappear.\n",
 			args[0], args[1], args[2]);
 
-	cur_acl = find_acl_by_name(args[0], known_acl);
+	if (*args[0])
+		cur_acl = find_acl_by_name(args[0], known_acl);
+	else
+		cur_acl = NULL;
+
 	if (!cur_acl) {
 		name = strdup(args[0]);
 		if (!name)
@@ -810,6 +1049,7 @@ const struct {
 	{ .name = "TRUE",           .expr = {"always_true",""}},
 	{ .name = "FALSE",          .expr = {"always_false",""}},
 	{ .name = "LOCALHOST",      .expr = {"src","127.0.0.1/8",""}},
+	{ .name = "HTTP",           .expr = {"req_proto_http",""}},
 	{ .name = "HTTP_1.0",       .expr = {"req_ver","1.0",""}},
 	{ .name = "HTTP_1.1",       .expr = {"req_ver","1.1",""}},
 	{ .name = "METH_CONNECT",   .expr = {"method","CONNECT",""}},
@@ -822,6 +1062,7 @@ const struct {
 	{ .name = "HTTP_URL_SLASH", .expr = {"url_beg","/",""}},
 	{ .name = "HTTP_URL_STAR",  .expr = {"url","*",""}},
 	{ .name = "HTTP_CONTENT",   .expr = {"hdr_val(content-length)","gt","0",""}},
+	{ .name = "RDP_COOKIE",     .expr = {"req_rdp_cookie_cnt","gt","0",""}},
 	{ .name = "REQ_CONTENT",    .expr = {"req_len","gt","0",""}},
 	{ .name = "WAIT_END",       .expr = {"wait_end",""}},
 	{ .name = NULL, .expr = {""}}
@@ -938,16 +1179,45 @@ struct acl_cond *parse_acl_cond(const char **args, struct list *known_acl, int p
 			continue;
 		}
 
-		/* search for <word> in the known ACL names. If we do not find
-		 * it, let's look for it in the default ACLs, and if found, add
-		 * it to the list of ACLs of this proxy. This makes it possible
-		 * to override them.
-		 */
-		cur_acl = find_acl_by_name(word, known_acl);
-		if (cur_acl == NULL) {
-			cur_acl = find_acl_default(word, known_acl);
-			if (cur_acl == NULL)
+		if (strcmp(word, "{") == 0) {
+			/* we may have a complete ACL expression between two braces,
+			 * find the last one.
+			 */
+			int arg_end = arg + 1;
+			const char **args_new;
+
+			while (*args[arg_end] && strcmp(args[arg_end], "}") != 0)
+				arg_end++;
+
+			if (!*args[arg_end])
 				goto out_free_suite;
+
+			args_new = calloc(1, (arg_end - arg + 1) * sizeof(*args_new));
+			if (!args_new)
+				goto out_free_suite;
+
+			args_new[0] = "";
+			memcpy(args_new + 1, args + arg + 1, (arg_end - arg) * sizeof(*args_new));
+			args_new[arg_end - arg] = "";
+			cur_acl = parse_acl(args_new, known_acl);
+			free(args_new);
+
+			if (!cur_acl)
+				goto out_free_suite;
+			arg = arg_end;
+		}
+		else {
+			/* search for <word> in the known ACL names. If we do not find
+			 * it, let's look for it in the default ACLs, and if found, add
+			 * it to the list of ACLs of this proxy. This makes it possible
+			 * to override them.
+			 */
+			cur_acl = find_acl_by_name(word, known_acl);
+			if (cur_acl == NULL) {
+				cur_acl = find_acl_default(word, known_acl);
+				if (cur_acl == NULL)
+					goto out_free_suite;
+			}
 		}
 
 		cur_term = (struct acl_term *)calloc(1, sizeof(*cur_term));
@@ -978,6 +1248,39 @@ struct acl_cond *parse_acl_cond(const char **args, struct list *known_acl, int p
 	free(cond);
  out_return:
 	return NULL;
+}
+
+/* Builds an ACL condition starting at the if/unless keyword. The complete
+ * condition is returned. NULL is returned in case of error or if the first
+ * word is neither "if" nor "unless". It automatically sets the file name and
+ * the line number in the condition for better error reporting, and adds the
+ * ACL requirements to the proxy's acl_requires.
+ */
+struct acl_cond *build_acl_cond(const char *file, int line, struct proxy *px, const char **args)
+{
+	int pol = ACL_COND_NONE;
+	struct acl_cond *cond = NULL;
+
+	if (!strcmp(*args, "if")) {
+		pol = ACL_COND_IF;
+		args++;
+	}
+	else if (!strcmp(*args, "unless")) {
+		pol = ACL_COND_UNLESS;
+		args++;
+	}
+	else
+		return NULL;
+
+	cond = parse_acl_cond(args, &px->acl, pol);
+	if (!cond)
+		return NULL;
+
+	cond->file = file;
+	cond->line = line;
+	px->acl_requires |= cond->requires;
+
+	return cond;
 }
 
 /* Execute condition <cond> and return either ACL_PAT_FAIL, ACL_PAT_MISS or
@@ -1048,12 +1351,24 @@ int acl_exec_cond(struct acl_cond *cond, struct proxy *px, struct session *l4, v
 						acl_res |= ACL_PAT_FAIL;
 				}
 				else {
+					if (!eb_is_empty(&expr->pattern_tree)) {
+						/* a tree is present, let's check what type it is */
+						if (expr->kw->match == acl_match_str)
+							acl_res |= acl_lookup_str(&test, expr) ? ACL_PAT_PASS : ACL_PAT_FAIL;
+						else if (expr->kw->match == acl_match_ip)
+							acl_res |= acl_lookup_ip(&test, expr) ? ACL_PAT_PASS : ACL_PAT_FAIL;
+					}
+
 					/* call the match() function for all tests on this value */
 					list_for_each_entry(pattern, &expr->patterns, list) {
-						acl_res |= expr->kw->match(&test, pattern);
 						if (acl_res == ACL_PAT_PASS)
 							break;
+						acl_res |= expr->kw->match(&test, pattern);
 					}
+
+					if ((test.flags & ACL_TEST_F_NULL_MATCH) &&
+					    LIST_ISEMPTY(&expr->patterns) && eb_is_empty(&expr->pattern_tree))
+						acl_res |= expr->kw->match(&test, NULL);
 				}
 				/*
 				 * OK now acl_res holds the result of this expression
@@ -1117,7 +1432,7 @@ int acl_exec_cond(struct acl_cond *cond, struct proxy *px, struct session *l4, v
  * through and never cached, because that way, this function can be used as a
  * late check.
  */
-struct acl *cond_find_require(struct acl_cond *cond, unsigned int require)
+struct acl *cond_find_require(const struct acl_cond *cond, unsigned int require)
 {
 	struct acl_term_suite *suite;
 	struct acl_term *term;
@@ -1133,6 +1448,125 @@ struct acl *cond_find_require(struct acl_cond *cond, unsigned int require)
 	return NULL;
 }
 
+/*
+ * Find targets for userlist and groups in acl. Function returns the number
+ * of errors or OK if everything is fine.
+ */
+int
+acl_find_targets(struct proxy *p)
+{
+
+	struct acl *acl;
+	struct acl_expr *expr;
+	struct acl_pattern *pattern;
+	struct userlist *ul;
+	int cfgerr = 0;
+
+	list_for_each_entry(acl, &p->acl, list) {
+		list_for_each_entry(expr, &acl->expr, list) {
+			if (strcmp(expr->kw->kw, "srv_is_up") == 0) {
+				struct proxy *px;
+				struct server *srv;
+				char *pname, *sname;
+
+				if (!expr->arg.str || !*expr->arg.str) {
+					Alert("proxy %s: acl %s %s(): missing server name.\n",
+						p->id, acl->name, expr->kw->kw);
+					cfgerr++;
+					continue;
+				}
+
+				pname = expr->arg.str;
+				sname = strrchr(pname, '/');
+
+				if (sname)
+					*sname++ = '\0';
+				else {
+					sname = pname;
+					pname = NULL;
+				}
+
+				px = p;
+				if (pname) {
+					px = findproxy(pname, PR_CAP_BE);
+					if (!px) {
+						Alert("proxy %s: acl %s %s(): unable to find proxy '%s'.\n",
+						      p->id, acl->name, expr->kw->kw, pname);
+						cfgerr++;
+						continue;
+					}
+				}
+
+				srv = findserver(px, sname);
+				if (!srv) {
+					Alert("proxy %s: acl %s %s(): unable to find server '%s'.\n",
+					      p->id, acl->name, expr->kw->kw, sname);
+					cfgerr++;
+					continue;
+				}
+
+				free(expr->arg.str);
+				expr->arg_len = 0;
+				expr->arg.srv = srv;
+				continue;
+			}
+
+			if (strstr(expr->kw->kw, "http_auth") == expr->kw->kw) {
+
+				if (!expr->arg.str || !*expr->arg.str) {
+					Alert("proxy %s: acl %s %s(): missing userlist name.\n",
+						p->id, acl->name, expr->kw->kw);
+					cfgerr++;
+					continue;
+				}
+
+				if (p->uri_auth && p->uri_auth->userlist &&
+				    !strcmp(p->uri_auth->userlist->name, expr->arg.str))
+					ul = p->uri_auth->userlist;
+				else
+					ul = auth_find_userlist(expr->arg.str);
+
+				if (!ul) {
+					Alert("proxy %s: acl %s %s(%s): unable to find userlist.\n",
+						p->id, acl->name, expr->kw->kw, expr->arg.str);
+					cfgerr++;
+					continue;
+				}
+
+				expr->arg_len = 0;
+				expr->arg.ul  = ul;
+			}
+
+
+			if (!strcmp(expr->kw->kw, "http_auth_group")) {
+
+				if (LIST_ISEMPTY(&expr->patterns)) {
+					Alert("proxy %s: acl %s %s(): no groups specified.\n",
+						p->id, acl->name, expr->kw->kw);
+					cfgerr++;
+					continue;
+				}
+
+				list_for_each_entry(pattern, &expr->patterns, list) {
+					pattern->val.group_mask = auth_resolve_groups(expr->arg.ul, pattern->ptr.str);
+
+					free(pattern->ptr.str);
+					pattern->ptr.str = NULL;
+					pattern->len = 0;
+
+					if (!pattern->val.group_mask) {
+						Alert("proxy %s: acl %s %s(): invalid group(s).\n",
+							p->id, acl->name, expr->kw->kw);
+						cfgerr++;
+						continue;
+					}
+				}
+			}
+		}
+	}
+
+	return cfgerr;
+}
 
 /************************************************************************/
 /*             All supported keywords must be declared here.            */

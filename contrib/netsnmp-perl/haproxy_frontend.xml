@@ -30,6 +30,20 @@
 			<direction>input</direction>
 			<oid>.1.3.6.1.4.1.29385.106.1.0.1</oid>
 		</feSvName>
+		<feSCur>
+			<name>Current Sessions</name>
+			<method>get</method>
+			<source>value</source>
+			<direction>output</direction>
+			<oid>.1.3.6.1.4.1.29385.106.1.0.4</oid>
+		</feSCur>
+		<feSMax>
+			<name>Maximum Sessions</name>
+			<method>get</method>
+			<source>value</source>
+			<direction>output</direction>
+			<oid>.1.3.6.1.4.1.29385.106.1.0.5</oid>
+		</feSMax>
 		<feSTot>
 			<name>Total Sessions</name>
 			<method>get</method>
@@ -58,5 +72,12 @@
 			<direction>output</direction>
 			<oid>.1.3.6.1.4.1.29385.106.1.0.9</oid>
 		</feBOut>
+		<feDReq>
+			<name>Denied Requests</name>
+			<method>get</method>
+			<source>value</source>
+			<direction>output</direction>
+			<oid>.1.3.6.1.4.1.29385.106.1.0.10</oid>
+		</feDReq>
 	</fields>
 </interface>

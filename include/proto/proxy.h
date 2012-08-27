@@ -1,23 +1,23 @@
 /*
-  include/proto/proxy.h
-  This file defines function prototypes for proxy management.
-
-  Copyright (C) 2000-2008 Willy Tarreau - w@1wt.eu
-  
-  This library is free software; you can redistribute it and/or
-  modify it under the terms of the GNU Lesser General Public
-  License as published by the Free Software Foundation, version 2.1
-  exclusively.
-
-  This library is distributed in the hope that it will be useful,
-  but WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public
-  License along with this library; if not, write to the Free Software
-  Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
-*/
+ * include/proto/proxy.h
+ * This file defines function prototypes for proxy management.
+ *
+ * Copyright (C) 2000-2009 Willy Tarreau - w@1wt.eu
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation, version 2.1
+ * exclusively.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
+ */
 
 #ifndef _PROTO_PROXY_H
 #define _PROTO_PROXY_H
@@ -35,12 +35,16 @@ void pause_proxy(struct proxy *p);
 void stop_proxy(struct proxy *p);
 void pause_proxies(void);
 void listen_proxies(void);
+int  session_set_backend(struct session *s, struct proxy *be);
 
 const char *proxy_cap_str(int cap);
 const char *proxy_mode_str(int mode);
-struct proxy *findproxy(const char *name, int mode, int cap);
+struct proxy *findproxy_mode(const char *name, int mode, int cap);
+struct proxy *findproxy(const char *name, int cap);
 struct server *findserver(const struct proxy *px, const char *name);
 int proxy_cfg_ensure_no_http(struct proxy *curproxy);
+int get_backend_server(const char *bk_name, const char *sv_name,
+		       struct proxy **bk, struct server **sv);
 
 /*
  * This function returns a string containing the type of the proxy in a format
@@ -65,21 +69,33 @@ static inline void proxy_reset_timeouts(struct proxy *proxy)
 }
 
 /* increase the number of cumulated connections on the designated frontend */
-static void inline proxy_inc_fe_ctr(struct proxy *fe)
+static void inline proxy_inc_fe_ctr(struct listener *l, struct proxy *fe)
 {
-	fe->cum_feconn++;
+	fe->counters.cum_feconn++;
+	if (l->counters)
+		l->counters->cum_conn++;
+
 	update_freq_ctr(&fe->fe_sess_per_sec, 1);
-	if (fe->fe_sess_per_sec.curr_ctr > fe->fe_sps_max)
-		fe->fe_sps_max = fe->fe_sess_per_sec.curr_ctr;
+	if (fe->fe_sess_per_sec.curr_ctr > fe->counters.fe_sps_max)
+		fe->counters.fe_sps_max = fe->fe_sess_per_sec.curr_ctr;
 }
 
 /* increase the number of cumulated connections on the designated backend */
 static void inline proxy_inc_be_ctr(struct proxy *be)
 {
-	be->cum_beconn++;
+	be->counters.cum_beconn++;
 	update_freq_ctr(&be->be_sess_per_sec, 1);
-	if (be->be_sess_per_sec.curr_ctr > be->be_sps_max)
-		be->be_sps_max = be->be_sess_per_sec.curr_ctr;
+	if (be->be_sess_per_sec.curr_ctr > be->counters.be_sps_max)
+		be->counters.be_sps_max = be->be_sess_per_sec.curr_ctr;
+}
+
+/* increase the number of cumulated requests on the designated frontend */
+static void inline proxy_inc_fe_req_ctr(struct proxy *fe)
+{
+	fe->counters.cum_fe_req++;
+	update_freq_ctr(&fe->fe_req_per_sec, 1);
+	if (fe->fe_req_per_sec.curr_ctr > fe->counters.fe_rps_max)
+		fe->counters.fe_rps_max = fe->fe_req_per_sec.curr_ctr;
 }
 
 #endif /* _PROTO_PROXY_H */

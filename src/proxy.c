@@ -30,15 +30,18 @@
 #include <proto/client.h>
 #include <proto/backend.h>
 #include <proto/fd.h>
+#include <proto/hdr_idx.h>
 #include <proto/log.h>
 #include <proto/protocols.h>
 #include <proto/proto_tcp.h>
+#include <proto/proto_http.h>
 #include <proto/proxy.h>
 
 
 int listeners;	/* # of proxy listeners, set by cfgparse, unset by maintain_proxies */
 struct proxy *proxy  = NULL;	/* list of all existing proxies */
-int next_pxid = 1;		/* UUID assigned to next new proxy, 0 reserved */
+struct eb_root used_proxy_id = EB_ROOT;	/* list of proxy IDs in use */
+unsigned int error_snapshot_id = 0;     /* global ID assigned to each error then incremented */
 
 /*
  * This function returns a string containing a name describing capabilities to
@@ -75,6 +78,49 @@ const char *proxy_mode_str(int mode) {
 		return "unknown";
 }
 
+/*
+ * This function scans the list of backends and servers to retrieve the first
+ * backend and the first server with the given names, and sets them in both
+ * parameters. It returns zero if either is not found, or non-zero and sets
+ * the ones it did not found to NULL. If a NULL pointer is passed for the
+ * backend, only the pointer to the server will be updated.
+ */
+int get_backend_server(const char *bk_name, const char *sv_name,
+		       struct proxy **bk, struct server **sv)
+{
+	struct proxy *p;
+	struct server *s;
+	int pid, sid;
+
+	*sv = NULL;
+
+	pid = 0;
+	if (*bk_name == '#')
+		pid = atoi(bk_name + 1);
+	sid = 0;
+	if (*sv_name == '#')
+		sid = atoi(sv_name + 1);
+
+	for (p = proxy; p; p = p->next)
+		if ((p->cap & PR_CAP_BE) &&
+		    ((pid && p->uuid == pid) ||
+		     (!pid && strcmp(p->id, bk_name) == 0)))
+			break;
+	if (bk)
+		*bk = p;
+	if (!p)
+		return 0;
+
+	for (s = p->srv; s; s = s->next)
+		if ((sid && s->puid == sid) ||
+		    (!sid && strcmp(s->id, sv_name) == 0))
+			break;
+	*sv = s;
+	if (!s)
+		return 0;
+	return 1;
+}
+
 /* This function parses a "timeout" statement in a proxy section. It returns
  * -1 if there is any error, 1 for a warning, otherwise zero. If it does not
  * return zero, it may write an error message into the <err> buffer, for at
@@ -109,10 +155,14 @@ static int proxy_parse_timeout(char **args, int section, struct proxy *proxy,
 		tv = &proxy->timeout.tarpit;
 		td = &defpx->timeout.tarpit;
 		cap = PR_CAP_FE | PR_CAP_BE;
+	} else if (!strcmp(args[0], "http-keep-alive")) {
+		tv = &proxy->timeout.httpka;
+		td = &defpx->timeout.httpka;
+		cap = PR_CAP_FE | PR_CAP_BE;
 	} else if (!strcmp(args[0], "http-request")) {
 		tv = &proxy->timeout.httpreq;
 		td = &defpx->timeout.httpreq;
-		cap = PR_CAP_FE;
+		cap = PR_CAP_FE | PR_CAP_BE;
 	} else if (!strcmp(args[0], "server") || !strcmp(args[0], "srvtimeout")) {
 		name = "server";
 		tv = &proxy->timeout.server;
@@ -127,10 +177,6 @@ static int proxy_parse_timeout(char **args, int section, struct proxy *proxy,
 		tv = &proxy->timeout.check;
 		td = &defpx->timeout.check;
 		cap = PR_CAP_BE;
-	} else if (!strcmp(args[0], "appsession")) {
-		tv = &proxy->timeout.appsession;
-		td = &defpx->timeout.appsession;
-		cap = PR_CAP_BE;
 	} else if (!strcmp(args[0], "queue")) {
 		tv = &proxy->timeout.queue;
 		td = &defpx->timeout.queue;
@@ -138,7 +184,7 @@ static int proxy_parse_timeout(char **args, int section, struct proxy *proxy,
 	} else {
 		snprintf(err, errlen,
 			 "timeout '%s': must be 'client', 'server', 'connect', 'check', "
-			 "'appsession', 'queue', 'http-request' or 'tarpit'",
+			 "'queue', 'http-keep-alive', 'http-request' or 'tarpit'",
 			 args[0]);
 		return -1;
 	}
@@ -237,7 +283,7 @@ static int proxy_parse_rate_limit(char **args, int section, struct proxy *proxy,
  * requested name as this often leads into unexpected situations.
  */
 
-struct proxy *findproxy(const char *name, int mode, int cap) {
+struct proxy *findproxy_mode(const char *name, int mode, int cap) {
 
 	struct proxy *curproxy, *target = NULL;
 
@@ -245,7 +291,8 @@ struct proxy *findproxy(const char *name, int mode, int cap) {
 		if ((curproxy->cap & cap)!=cap || strcmp(curproxy->id, name))
 			continue;
 
-		if (curproxy->mode != mode) {
+		if (curproxy->mode != mode &&
+		    !(curproxy->mode == PR_MODE_HTTP && mode == PR_MODE_TCP)) {
 			Alert("Unable to use proxy '%s' with wrong mode, required: %s, has: %s.\n", 
 				name, proxy_mode_str(mode), proxy_mode_str(curproxy->mode));
 			Alert("You may want to use 'mode %s'.\n", proxy_mode_str(mode));
@@ -259,6 +306,35 @@ struct proxy *findproxy(const char *name, int mode, int cap) {
 
 		Alert("Refusing to use duplicated proxy '%s' with overlapping capabilities: %s/%s!\n",
 			name, proxy_type_str(curproxy), proxy_type_str(target));
+
+		return NULL;
+	}
+
+	return target;
+}
+
+/* Returns a pointer to the proxy matching either name <name>, or id <name> if
+ * <name> begins with a '#'. NULL is returned if no match is found, as well as
+ * if multiple matches are found (eg: too large capabilities mask).
+ */
+struct proxy *findproxy(const char *name, int cap) {
+
+	struct proxy *curproxy, *target = NULL;
+	int pid = 0;
+
+	if (*name == '#')
+		pid = atoi(name + 1);
+
+	for (curproxy = proxy; curproxy; curproxy = curproxy->next) {
+		if ((curproxy->cap & cap) != cap ||
+		    (pid && curproxy->uuid != pid) ||
+		    (!pid && strcmp(curproxy->id, name)))
+			continue;
+
+		if (!target) {
+			target = curproxy;
+			continue;
+		}
 
 		return NULL;
 	}
@@ -288,7 +364,7 @@ struct server *findserver(const struct proxy *px, const char *name) {
 			continue;
 		}
 
-		Alert("Refusing to use duplicated server '%s' fould in proxy: %s!\n",
+		Alert("Refusing to use duplicated server '%s' found in proxy: %s!\n",
 			name, px->id);
 
 		return NULL;
@@ -321,10 +397,15 @@ int proxy_cfg_ensure_no_http(struct proxy *curproxy)
 		Warning("config : monitor-uri will be ignored for %s '%s' (needs 'mode http').\n",
 			proxy_type_str(curproxy), curproxy->id);
 	}
-	if (curproxy->lbprm.algo & BE_LB_PROP_L7) {
+	if (curproxy->lbprm.algo & BE_LB_NEED_HTTP) {
 		curproxy->lbprm.algo &= ~BE_LB_ALGO;
 		curproxy->lbprm.algo |= BE_LB_ALGO_RR;
 		Warning("config : Layer 7 hash not possible for %s '%s' (needs 'mode http'). Falling back to round robin.\n",
+			proxy_type_str(curproxy), curproxy->id);
+	}
+	if (curproxy->to_log & (LW_REQ | LW_RESP)) {
+		curproxy->to_log &= ~(LW_REQ | LW_RESP);
+		Warning("config : 'option httplog' not usable with %s '%s' (needs 'mode http'). Falling back to 'option tcplog'.\n",
 			proxy_type_str(curproxy), curproxy->id);
 	}
 	return 0;
@@ -415,7 +496,7 @@ void maintain_proxies(int *next)
 				goto do_block;
 
 			if (p->fe_sps_lim &&
-			    (wait = next_event_delay(&p->fe_sess_per_sec, p->fe_sps_lim, 0))) {
+			    (wait = next_event_delay(&p->fe_sess_per_sec, p->fe_sps_lim, 1))) {
 				/* we're blocking because a limit was reached on the number of
 				 * requests/s on the frontend. We want to re-check ASAP, which
 				 * means in 1 ms before estimated expiration date, because the
@@ -460,8 +541,10 @@ void maintain_proxies(int *next)
 				int t;
 				t = tick_remain(now_ms, p->stop_time);
 				if (t == 0) {
-					Warning("Proxy %s stopped.\n", p->id);
-					send_log(p, LOG_WARNING, "Proxy %s stopped.\n", p->id);
+					Warning("Proxy %s stopped (FE: %lld conns, BE: %lld conns).\n",
+						p->id, p->counters.cum_feconn, p->counters.cum_beconn);
+					send_log(p, LOG_WARNING, "Proxy %s stopped (FE: %lld conns, BE: %lld conns).\n",
+						 p->id, p->counters.cum_feconn, p->counters.cum_beconn);
 					stop_proxy(p);
 					/* try to free more memory */
 					pool_gc2();
@@ -629,6 +712,63 @@ void listen_proxies(void)
 		}
 		p = p->next;
 	}
+}
+
+/* Set current session's backend to <be>. Nothing is done if the
+ * session already had a backend assigned, which is indicated by
+ * s->flags & SN_BE_ASSIGNED.
+ * All flags, stats and counters which need be updated are updated.
+ * Returns 1 if done, 0 in case of internal error, eg: lack of resource.
+ */
+int session_set_backend(struct session *s, struct proxy *be)
+{
+	if (s->flags & SN_BE_ASSIGNED)
+		return 1;
+	s->be = be;
+	be->beconn++;
+	if (be->beconn > be->counters.beconn_max)
+		be->counters.beconn_max = be->beconn;
+	proxy_inc_be_ctr(be);
+
+	/* assign new parameters to the session from the new backend */
+	s->rep->rto = s->req->wto = be->timeout.server;
+	s->req->cto = be->timeout.connect;
+	s->conn_retries = be->conn_retries;
+	s->si[1].flags &= ~SI_FL_INDEP_STR;
+	if (be->options2 & PR_O2_INDEPSTR)
+		s->si[1].flags |= SI_FL_INDEP_STR;
+
+	if (be->options2 & PR_O2_RSPBUG_OK)
+		s->txn.rsp.err_pos = -1; /* let buggy responses pass */
+	s->flags |= SN_BE_ASSIGNED;
+
+	/* If the target backend requires HTTP processing, we have to allocate
+	 * a struct hdr_idx for it if we did not have one.
+	 */
+	if (unlikely(!s->txn.hdr_idx.v && (be->acl_requires & ACL_USE_L7_ANY))) {
+		if ((s->txn.hdr_idx.v = pool_alloc2(s->fe->hdr_idx_pool)) == NULL)
+			return 0; /* not enough memory */
+
+		/* and now initialize the HTTP transaction state */
+		http_init_txn(s);
+
+		s->txn.hdr_idx.size = MAX_HTTP_HDR;
+		hdr_idx_init(&s->txn.hdr_idx);
+	}
+
+	if (be->options2 & PR_O2_NODELAY) {
+		s->req->flags |= BF_NEVER_WAIT;
+		s->rep->flags |= BF_NEVER_WAIT;
+	}
+
+	/* We want to enable the backend-specific analysers except those which
+	 * were already run as part of the frontend/listener. Note that it would
+	 * be more reliable to store the list of analysers that have been run,
+	 * but what we do here is OK for now.
+	 */
+	s->req->analysers |= be->be_req_ana & ~(s->listener->analysers);
+
+	return 1;
 }
 
 static struct cfg_kw_list cfg_kws = {{ },{

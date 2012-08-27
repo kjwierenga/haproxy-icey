@@ -2,7 +2,7 @@
   include/types/protocols.h
   This file defines the structures used by generic network protocols.
 
-  Copyright (C) 2000-2008 Willy Tarreau - w@1wt.eu
+  Copyright (C) 2000-2009 Willy Tarreau - w@1wt.eu
 
   This library is free software; you can redistribute it and/or
   modify it under the terms of the GNU Lesser General Public
@@ -29,7 +29,9 @@
 
 #include <common/config.h>
 #include <common/mini-clist.h>
+#include <eb32tree.h>
 
+#include <types/counters.h>
 #include <types/task.h>
 
 /* max length of a protcol name, including trailing zero */
@@ -68,6 +70,8 @@
 #define LI_O_NONE	0x0000
 #define LI_O_NOLINGER	0x0001	/* disable linger on this socket */
 #define LI_O_FOREIGN	0x0002	/* permit listening on foreing addresses */
+#define LI_O_NOQUICKACK	0x0004	/* disable quick ack of immediate data (linux) */
+#define LI_O_DEF_ACCEPT	0x0008	/* wait up to 1 second for data before accepting */
 
 /* The listener will be directly referenced by the fdtab[] which holds its
  * socket. The listener provides the protocol-specific accept() function to
@@ -75,8 +79,11 @@
  */
 struct listener {
 	int fd;				/* the listen socket */
+	char *name;			/* */
+	int luid;			/* listener universally unique ID, used for SNMP */
 	int state;			/* state: NEW, INIT, ASSIGNED, LISTEN, READY, FULL */
 	int options;			/* socket options : LI_O_* */
+	struct licounters *counters;	/* statistics counters */
 	struct sockaddr_storage addr;	/* the address we listen to */
 	struct protocol *proto;		/* protocol this listener belongs to */
 	int nbconn;			/* current number of connections on this listener */
@@ -89,14 +96,23 @@ struct listener {
 	int  *timeout;                  /* pointer to client-side timeout */
 	void *private;			/* any private data which may be used by accept() */
 	unsigned int analysers;		/* bitmap of required protocol analysers */
+	int nice;			/* nice value to assign to the instanciated tasks */
 	union {				/* protocol-dependant access restrictions */
 		struct {		/* UNIX socket permissions */
 			uid_t uid;	/* -1 to leave unchanged */
 			gid_t gid;	/* -1 to leave unchanged */
 			mode_t mode;	/* 0 to leave unchanged */
+			int level;	/* access level (ACCESS_LVL_*) */
 		} ux;
 	} perm;
 	char *interface;		/* interface name or NULL */
+	int maxseg;			/* for TCP, advertised MSS */
+
+	struct {
+		const char *file;	/* file where the section appears */
+		int line;		/* line where the section appears */
+		struct eb32_node id;	/* place in the tree of used IDs */
+	} conf;				/* config information */
 };
 
 /* This structure contains all information needed to easily handle a protocol.

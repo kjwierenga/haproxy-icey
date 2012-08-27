@@ -1,23 +1,23 @@
 /*
-  include/types/session.h
-  This file defines everything related to sessions.
-
-  Copyright (C) 2000-2008 Willy Tarreau - w@1wt.eu
-
-  This library is free software; you can redistribute it and/or
-  modify it under the terms of the GNU Lesser General Public
-  License as published by the Free Software Foundation, version 2.1
-  exclusively.
-
-  This library is distributed in the hope that it will be useful,
-  but WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public
-  License along with this library; if not, write to the Free Software
-  Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
-*/
+ * include/types/session.h
+ * This file defines everything related to sessions.
+ *
+ * Copyright (C) 2000-2010 Willy Tarreau - w@1wt.eu
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation, version 2.1
+ * exclusively.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
+ */
 
 #ifndef _TYPES_SESSION_H
 #define _TYPES_SESSION_H
@@ -38,6 +38,7 @@
 #include <types/server.h>
 #include <types/stream_interface.h>
 #include <types/task.h>
+#include <types/stick_table.h>
 
 
 /* various session flags, bits values 0x01 to 0x100 (shift 0) */
@@ -45,14 +46,15 @@
 #define SN_ASSIGNED	0x00000002	/* no need to assign a server to this session */
 #define SN_ADDR_SET	0x00000004	/* this session's server address has been set */
 #define SN_BE_ASSIGNED	0x00000008	/* a backend was assigned. Conns are accounted. */
-#define SN_CONN_CLOSED	0x00000010	/* "Connection: close" was present or added */
+
+#define SN_FORCE_PRST	0x00000010	/* force persistence here, even if server is down */
 #define SN_MONITOR	0x00000020	/* this session comes from a monitoring system */
 #define SN_CURR_SESS	0x00000040	/* a connection is currently being counted on the server */
 #define SN_FRT_ADDR_SET	0x00000080	/* set if the frontend address has been filled */
 #define SN_REDISP	0x00000100	/* set if this session was redispatched from one server to another */
 #define SN_CONN_TAR	0x00000200	/* set if this session is turning around before reconnecting */
 #define SN_REDIRECTABLE	0x00000400	/* set if this session is redirectable (GET or HEAD) */
-/* unused:              0x00000800 */
+#define SN_TUNNEL	0x00000800	/* tunnel-mode session, nothing to catch after data */
 
 /* session termination conditions, bits values 0x1000 to 0x7000 (0-7 shift 12) */
 #define SN_ERR_NONE     0x00000000
@@ -78,6 +80,8 @@
 #define SN_FINST_MASK	0x00070000	/* mask to get only final session state flags */
 #define	SN_FINST_SHIFT	16		/* bit shift */
 /* unused:              0x00080000 */
+
+#define SN_IGNORE_PRST	0x00100000	/* ignore persistence */
 
 /* WARNING: if new fields are added, they must be initialized in event_accept()
  * and freed in session_free() !
@@ -168,12 +172,20 @@ struct session {
 	struct sockaddr_storage cli_addr;	/* the client address */
 	struct sockaddr_storage frt_addr;	/* the frontend address reached by the client if SN_FRT_ADDR_SET is set */
 	struct sockaddr_in srv_addr;		/* the address to connect to */
+	struct sockaddr_in from_addr;		/* the address to spoof when connecting to the server (transparent mode) */
 	struct server *srv;			/* the server the session will be running or has been running on */
 	struct server *srv_conn;		/* session already has a slot on a server and is not in queue */
 	struct server *prev_srv;		/* the server the was running on, after a redispatch, otherwise NULL */
 	struct pendconn *pend_pos;		/* if not NULL, points to the position in the pending queue */
 	struct http_txn txn;			/* current HTTP transaction being processed. Should become a list. */
-	int ana_state;				/* analyser state, used by analysers, always set to zero between them */
+
+	struct {
+		struct stksess *ts;
+		struct stktable *table;
+		int flags;
+	} store[8];				/* tracked stickiness values to store */
+	int store_count;
+
 	struct {
 		int logwait;			/* log fields waiting to be collected : LW_* */
 		struct timeval accept_date;	/* date of the accept() in user date */
@@ -197,12 +209,18 @@ struct session {
 		struct {
 			struct proxy *px;
 			struct server *sv;
+			struct listener *l;
 			short px_st, sv_st;	/* DATA_ST_INIT or DATA_ST_DATA */
 			unsigned int flags;	/* STAT_* */
 			int iid, type, sid;	/* proxy id, type and service id if bounding of stats is enabled */
+			const char *st_code;	/* pointer to the status code returned by an action */
 		} stats;
 		struct {
-			struct bref bref;
+			struct bref bref;	/* back-reference from the session being dumped */
+			void *target;		/* session we want to dump, or NULL for all */
+			unsigned int uid;	/* if non-null, the uniq_id of the session being dumped */
+			int section;		/* section of the session being dumped */
+			int pos;		/* last position of the current session's buffer */
 		} sess;
 		struct {
 			int iid;		/* if >= 0, ID of the proxy to filter on */
@@ -212,7 +230,10 @@ struct session {
 			int ptr;		/* <0: headers, >=0 : text pointer to restart from */
 			int bol;		/* pointer to beginning of current line */
 		} errors;
-	} data_ctx;				/* used by produce_content to dump the stats right now */
+		struct {
+			const char *msg;	/* pointer to a persistent message to be returned in PRINT state */
+		} cli;
+	} data_ctx;				/* used by stats I/O handlers to dump the stats */
 	unsigned int uniq_id;			/* unique ID used for the traces */
 };
 

@@ -1,7 +1,7 @@
 /*
  * General purpose functions.
  *
- * Copyright 2000-2009 Willy Tarreau <w@1wt.eu>
+ * Copyright 2000-2010 Willy Tarreau <w@1wt.eu>
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License
@@ -21,6 +21,7 @@
 
 #include <common/config.h>
 #include <common/standard.h>
+#include <eb32tree.h>
 #include <proto/log.h>
 
 /* enough to store 10 integers of :
@@ -56,7 +57,7 @@ int strlcpy2(char *dst, const char *src, int size)
  * This function simply returns a locally allocated string containing
  * the ascii representation for number 'n' in decimal.
  */
-const char *ultoa_r(unsigned long n, char *buffer, int size)
+char *ultoa_r(unsigned long n, char *buffer, int size)
 {
 	char *pos;
 	
@@ -118,6 +119,7 @@ const char *limit_r(unsigned long n, char *buffer, int size, const char *alt)
 /*
  * converts <str> to a struct sockaddr_un* which is locally allocated.
  * The format is "/path", where "/path" is a path to a UNIX domain socket.
+ * NULL is returned if the socket path is invalid (too long).
  */
 struct sockaddr_un *str2sun(const char *str)
 {
@@ -127,8 +129,7 @@ struct sockaddr_un *str2sun(const char *str)
 	memset(&su, 0, sizeof(su));
 	strsz = strlen(str) + 1;
 	if (strsz > sizeof(su.sun_path)) {
-		Alert("Socket path '%s' too long (max %d)\n",
-		      str, (int)sizeof(su.sun_path) - 1);
+		return NULL;
 	} else {
 		su.sun_family = AF_UNIX;
 		memcpy(su.sun_path, str, strsz);
@@ -158,6 +159,21 @@ int ishex(char s)
 }
 
 /*
+ * Return integer equivalent of character <c> for a hex digit (0-9, a-f, A-F),
+ * otherwise -1. This compact form helps gcc produce efficient code.
+ */
+int hex2i(int c)
+{
+	if ((unsigned char)(c -= '0') > 9) {
+		if ((unsigned char)(c -= 'A' - '0') > 5 &&
+		    (unsigned char)(c -= 'a' - 'A') > 5)
+			c = -11;
+		c += 10;
+	}
+	return c;
+}
+
+/*
  * Checks <name> for invalid characters. Valid chars are [A-Za-z0-9_:.-]. If an
  * invalid character is found, a pointer to it is returned. If everything is
  * fine, NULL is returned.
@@ -168,7 +184,7 @@ const char *invalid_char(const char *name)
 		return name;
 
 	while (*name) {
-		if (!isalnum((int)*name) && *name != '.' && *name != ':' &&
+		if (!isalnum((int)(unsigned char)*name) && *name != '.' && *name != ':' &&
 		    *name != '_' && *name != '-')
 			return name;
 		name++;
@@ -187,7 +203,7 @@ const char *invalid_domainchar(const char *name) {
 		return name;
 
 	while (*name) {
-		if (!isalnum((int)*name) && *name != '.' &&
+		if (!isalnum((int)(unsigned char)*name) && *name != '.' &&
 		    *name != '_' && *name != '-')
 			return name;
 
@@ -200,18 +216,20 @@ const char *invalid_domainchar(const char *name) {
 /*
  * converts <str> to a struct sockaddr_in* which is locally allocated.
  * The format is "addr:port", where "addr" can be a dotted IPv4 address,
- * a host name, or empty or "*" to indicate INADDR_ANY.
+ * a host name, or empty or "*" to indicate INADDR_ANY. NULL is returned
+ * if the host part cannot be resolved.
  */
 struct sockaddr_in *str2sa(char *str)
 {
 	static struct sockaddr_in sa;
+	struct sockaddr_in *ret = NULL;
 	char *c;
 	int port;
 
 	memset(&sa, 0, sizeof(sa));
 	str = strdup(str);
 	if (str == NULL)
-		goto out_nofree;
+		goto out;
 
 	if ((c = strrchr(str,':')) != NULL) {
 		*c++ = '\0';
@@ -224,20 +242,17 @@ struct sockaddr_in *str2sa(char *str)
 		sa.sin_addr.s_addr = INADDR_ANY;
 	}
 	else if (!inet_pton(AF_INET, str, &sa.sin_addr)) {
-		struct hostent *he;
-
-		if ((he = gethostbyname(str)) == NULL) {
-			Alert("Invalid server name: '%s'\n", str);
-		}
-		else
-			sa.sin_addr = *(struct in_addr *) *(he->h_addr_list);
+		struct hostent *he = gethostbyname(str);
+		if (!he)
+			goto out;
+		sa.sin_addr = *(struct in_addr *) *(he->h_addr_list);
 	}
 	sa.sin_port   = htons(port);
 	sa.sin_family = AF_INET;
-
+	ret = &sa;
+ out:
 	free(str);
- out_nofree:
-	return &sa;
+	return ret;
 }
 
 /*
@@ -247,18 +262,20 @@ struct sockaddr_in *str2sa(char *str)
  * port is set in the sockaddr_in. Thus, it is enough to check the size of the
  * returned range to know if an array must be allocated or not. The format is
  * "addr[:port[-port]]", where "addr" can be a dotted IPv4 address, a host
- * name, or empty or "*" to indicate INADDR_ANY.
+ * name, or empty or "*" to indicate INADDR_ANY. NULL is returned if the host
+ * part cannot be resolved.
  */
 struct sockaddr_in *str2sa_range(char *str, int *low, int *high)
 {
 	static struct sockaddr_in sa;
+	struct sockaddr_in *ret = NULL;
 	char *c;
 	int portl, porth;
 
 	memset(&sa, 0, sizeof(sa));
 	str = strdup(str);
 	if (str == NULL)
-		goto out_nofree;
+		goto out;
 
 	if ((c = strrchr(str,':')) != NULL) {
 		char *sep;
@@ -280,23 +297,45 @@ struct sockaddr_in *str2sa_range(char *str, int *low, int *high)
 		sa.sin_addr.s_addr = INADDR_ANY;
 	}
 	else if (!inet_pton(AF_INET, str, &sa.sin_addr)) {
-		struct hostent *he;
-
-		if ((he = gethostbyname(str)) == NULL) {
-			Alert("Invalid server name: '%s'\n", str);
-		}
-		else
-			sa.sin_addr = *(struct in_addr *) *(he->h_addr_list);
+		struct hostent *he = gethostbyname(str);
+		if (!he)
+			goto out;
+		sa.sin_addr = *(struct in_addr *) *(he->h_addr_list);
 	}
 	sa.sin_port   = htons(portl);
 	sa.sin_family = AF_INET;
+	ret = &sa;
 
 	*low = portl;
 	*high = porth;
 
+ out:
 	free(str);
- out_nofree:
-	return &sa;
+	return ret;
+}
+
+/* converts <str> to a struct in_addr containing a network mask. It can be
+ * passed in dotted form (255.255.255.0) or in CIDR form (24). It returns 1
+ * if the conversion succeeds otherwise non-zero.
+ */
+int str2mask(const char *str, struct in_addr *mask)
+{
+	if (strchr(str, '.') != NULL) {	    /* dotted notation */
+		if (!inet_pton(AF_INET, str, mask))
+			return 0;
+	}
+	else { /* mask length */
+		char *err;
+		unsigned long len = strtol(str, &err, 10);
+
+		if (!*str || (err && *err) || (unsigned)len > 32)
+			return 0;
+		if (len)
+			mask->s_addr = htonl(~0UL << (32 - len));
+		else
+			mask->s_addr = 0;
+	}
+	return 1;
 }
 
 /*
@@ -310,7 +349,6 @@ int str2net(const char *str, struct in_addr *addr, struct in_addr *mask)
 	__label__ out_free, out_err;
 	char *c, *s;
 	int ret_val;
-	unsigned long len;
 
 	s = strdup(str);
 	if (!s)
@@ -322,20 +360,8 @@ int str2net(const char *str, struct in_addr *addr, struct in_addr *mask)
 	if ((c = strrchr(s, '/')) != NULL) {
 		*c++ = '\0';
 		/* c points to the mask */
-		if (strchr(c, '.') != NULL) {	    /* dotted notation */
-			if (!inet_pton(AF_INET, c, mask))
-				goto out_err;
-		}
-		else { /* mask length */
-			char *err;
-			len = strtol(c, &err, 10);
-			if (!*c || (err && *err) || (unsigned)len > 32)
-				goto out_err;
-			if (len)
-				mask->s_addr = htonl(~0UL << (32 - len));
-			else
-				mask->s_addr = 0;
-		}
+		if (!str2mask(c, mask))
+			goto out_err;
 	}
 	else {
 		mask->s_addr = ~0U;
@@ -488,6 +514,40 @@ char *encode_string(char *start, char *stop,
 	return start;
 }
 
+/* Decode an URL-encoded string in-place. The resulting string might
+ * be shorter. If some forbidden characters are found, the conversion is
+ * aborted, the string is truncated before the issue and non-zero is returned,
+ * otherwise the operation returns non-zero indicating success.
+ */
+int url_decode(char *string)
+{
+	char *in, *out;
+	int ret = 0;
+
+	in = string;
+	out = string;
+	while (*in) {
+		switch (*in) {
+		case '+' :
+			*out++ = ' ';
+			break;
+		case '%' :
+			if (!ishex(in[1]) || !ishex(in[2]))
+				goto end;
+			*out++ = (hex2i(in[1]) << 4) + hex2i(in[2]);
+			in += 2;
+			break;
+		default:
+			*out++ = *in;
+			break;
+		}
+		in++;
+	}
+	ret = 1; /* success */
+ end:
+	*out = 0;
+	return ret;
+}
 
 unsigned int str2ui(const char *s)
 {
@@ -713,6 +773,57 @@ const char *parse_time_err(const char *text, unsigned *ret, unsigned unit_flags)
 	return NULL;
 }
 
+/* this function converts the string starting at <text> to an unsigned int
+ * stored in <ret>. If an error is detected, the pointer to the unexpected
+ * character is returned. If the conversio is succesful, NULL is returned.
+ */
+const char *parse_size_err(const char *text, unsigned *ret) {
+	unsigned value = 0;
+
+	while (1) {
+		unsigned int j;
+
+		j = *text - '0';
+		if (j > 9)
+			break;
+		if (value > ~0U / 10)
+			return text;
+		value *= 10;
+		if (value > (value + j))
+			return text;
+		value += j;
+		text++;
+	}
+
+	switch (*text) {
+	case '\0':
+		break;
+	case 'K':
+	case 'k':
+		if (value > ~0U >> 10)
+			return text;
+		value = value << 10;
+		break;
+	case 'M':
+	case 'm':
+		if (value > ~0U >> 20)
+			return text;
+		value = value << 20;
+		break;
+	case 'G':
+	case 'g':
+		if (value > ~0U >> 30)
+			return text;
+		value = value << 30;
+		break;
+	default:
+		return text;
+	}
+
+	*ret = value;
+	return NULL;
+}
+
 /* copies at most <n> characters from <src> and always terminates with '\0' */
 char *my_strndup(const char *src, int n)
 {
@@ -728,6 +839,206 @@ char *my_strndup(const char *src, int n)
 	memcpy(ret, src, len);
 	ret[len] = '\0';
 	return ret;
+}
+
+/* This function returns the first unused key greater than or equal to <key> in
+ * ID tree <root>. Zero is returned if no place is found.
+ */
+unsigned int get_next_id(struct eb_root *root, unsigned int key)
+{
+	struct eb32_node *used;
+
+	do {
+		used = eb32_lookup_ge(root, key);
+		if (!used || used->key > key)
+			return key; /* key is available */
+		key++;
+	} while (key);
+	return key;
+}
+
+/* This function compares a sample word possibly followed by blanks to another
+ * clean word. The compare is case-insensitive. 1 is returned if both are equal,
+ * otherwise zero. This intends to be used when checking HTTP headers for some
+ * values. Note that it validates a word followed only by blanks but does not
+ * validate a word followed by blanks then other chars.
+ */
+int word_match(const char *sample, int slen, const char *word, int wlen)
+{
+	if (slen < wlen)
+		return 0;
+
+	while (wlen) {
+		char c = *sample ^ *word;
+		if (c && c != ('A' ^ 'a'))
+			return 0;
+		sample++;
+		word++;
+		slen--;
+		wlen--;
+	}
+
+	while (slen) {
+		if (*sample != ' ' && *sample != '\t')
+			return 0;
+		sample++;
+		slen--;
+	}
+	return 1;
+}
+
+/* Converts any text-formatted IPv4 address to a host-order IPv4 address. It
+ * is particularly fast because it avoids expensive operations such as
+ * multiplies, which are optimized away at the end. It requires a properly
+ * formated address though (3 points).
+ */
+unsigned int inetaddr_host(const char *text)
+{
+	const unsigned int ascii_zero = ('0' << 24) | ('0' << 16) | ('0' << 8) | '0';
+	register unsigned int dig100, dig10, dig1;
+	int s;
+	const char *p, *d;
+
+	dig1 = dig10 = dig100 = ascii_zero;
+	s = 24;
+
+	p = text;
+	while (1) {
+		if (((unsigned)(*p - '0')) <= 9) {
+			p++;
+			continue;
+		}
+
+		/* here, we have a complete byte between <text> and <p> (exclusive) */
+		if (p == text)
+			goto end;
+
+		d = p - 1;
+		dig1   |= (unsigned int)(*d << s);
+		if (d == text)
+			goto end;
+
+		d--;
+		dig10  |= (unsigned int)(*d << s);
+		if (d == text)
+			goto end;
+
+		d--;
+		dig100 |= (unsigned int)(*d << s);
+	end:
+		if (!s || *p != '.')
+			break;
+
+		s -= 8;
+		text = ++p;
+	}
+
+	dig100 -= ascii_zero;
+	dig10  -= ascii_zero;
+	dig1   -= ascii_zero;
+	return ((dig100 * 10) + dig10) * 10 + dig1;
+}
+
+/*
+ * Idem except the first unparsed character has to be passed in <stop>.
+ */
+unsigned int inetaddr_host_lim(const char *text, const char *stop)
+{
+	const unsigned int ascii_zero = ('0' << 24) | ('0' << 16) | ('0' << 8) | '0';
+	register unsigned int dig100, dig10, dig1;
+	int s;
+	const char *p, *d;
+
+	dig1 = dig10 = dig100 = ascii_zero;
+	s = 24;
+
+	p = text;
+	while (1) {
+		if (((unsigned)(*p - '0')) <= 9 && p < stop) {
+			p++;
+			continue;
+		}
+
+		/* here, we have a complete byte between <text> and <p> (exclusive) */
+		if (p == text)
+			goto end;
+
+		d = p - 1;
+		dig1   |= (unsigned int)(*d << s);
+		if (d == text)
+			goto end;
+
+		d--;
+		dig10  |= (unsigned int)(*d << s);
+		if (d == text)
+			goto end;
+
+		d--;
+		dig100 |= (unsigned int)(*d << s);
+	end:
+		if (!s || p == stop || *p != '.')
+			break;
+
+		s -= 8;
+		text = ++p;
+	}
+
+	dig100 -= ascii_zero;
+	dig10  -= ascii_zero;
+	dig1   -= ascii_zero;
+	return ((dig100 * 10) + dig10) * 10 + dig1;
+}
+
+/*
+ * Idem except the pointer to first unparsed byte is returned into <ret> which
+ * must not be NULL.
+ */
+unsigned int inetaddr_host_lim_ret(const char *text, char *stop, const char **ret)
+{
+	const unsigned int ascii_zero = ('0' << 24) | ('0' << 16) | ('0' << 8) | '0';
+	register unsigned int dig100, dig10, dig1;
+	int s;
+	const char *p, *d;
+
+	dig1 = dig10 = dig100 = ascii_zero;
+	s = 24;
+
+	p = text;
+	while (1) {
+		if (((unsigned)(*p - '0')) <= 9 && p < stop) {
+			p++;
+			continue;
+		}
+
+		/* here, we have a complete byte between <text> and <p> (exclusive) */
+		if (p == text)
+			goto end;
+
+		d = p - 1;
+		dig1   |= (unsigned int)(*d << s);
+		if (d == text)
+			goto end;
+
+		d--;
+		dig10  |= (unsigned int)(*d << s);
+		if (d == text)
+			goto end;
+
+		d--;
+		dig100 |= (unsigned int)(*d << s);
+	end:
+		if (!s || p == stop || *p != '.')
+			break;
+
+		s -= 8;
+		text = ++p;
+	}
+
+	*ret = p;
+	dig100 -= ascii_zero;
+	dig10  -= ascii_zero;
+	dig1   -= ascii_zero;
+	return ((dig100 * 10) + dig10) * 10 + dig1;
 }
 
 /*

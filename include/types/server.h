@@ -26,15 +26,17 @@
 #include <arpa/inet.h>
 
 #include <common/config.h>
-#include <common/eb32tree.h>
 #include <common/mini-clist.h>
+#include <eb32tree.h>
 
 #include <types/buffers.h>
+#include <types/counters.h>
 #include <types/freq_ctr.h>
 #include <types/port_range.h>
 #include <types/proxy.h>
 #include <types/queue.h>
 #include <types/task.h>
+#include <types/checks.h>
 
 
 /* server flags */
@@ -45,11 +47,12 @@
 #define SRV_CHECKED	0x0010	/* this server needs to be checked */
 #define SRV_GOINGDOWN	0x0020	/* this server says that it's going down (404) */
 #define SRV_WARMINGUP	0x0040	/* this server is warming up after a failure */
-/* unused: 0x0080 */
+#define SRV_MAINTAIN	0x0080	/* this server is in maintenance mode */
 #define SRV_TPROXY_ADDR	0x0100	/* bind to this non-local address to reach this server */
 #define SRV_TPROXY_CIP	0x0200	/* bind to the client's IP address to reach this server */
 #define SRV_TPROXY_CLI	0x0300	/* bind to the client's IP+port to reach this server */
-#define SRV_TPROXY_MASK	0x0300	/* bind to a non-local address to reach this server */
+#define SRV_TPROXY_DYN	0x0400	/* bind to a dynamically computed non-local address */
+#define SRV_TPROXY_MASK	0x0700	/* bind to a non-local address to reach this server */
 
 /* function which act on servers need to return various errors */
 #define SRV_STATUS_OK       0   /* everything is OK. */
@@ -70,28 +73,43 @@
 #define SRV_EWGHT_RANGE (SRV_UWGHT_RANGE * BE_WEIGHT_SCALE)
 #define SRV_EWGHT_MAX   (SRV_UWGHT_MAX   * BE_WEIGHT_SCALE)
 
+/* A tree occurrence is a descriptor of a place in a tree, with a pointer back
+ * to the server itself.
+ */
+struct server;
+struct tree_occ {
+	struct server *server;
+	struct eb32_node node;
+};
+
 struct server {
 	struct server *next;
 	int state;				/* server state (SRV_*) */
 	int prev_state;				/* server state before last change (SRV_*) */
-	int  cklen;				/* the len of the cookie, to speed up checks */
+	int cklen;				/* the len of the cookie, to speed up checks */
 	int rdr_len;				/* the length of the redirection prefix */
 	char *cookie;				/* the id set in the cookie */
 	char *rdr_pfx;				/* the redirection prefix */
 
 	struct proxy *proxy;			/* the proxy this server belongs to */
 	int served;				/* # of active sessions currently being served (ie not pending) */
-	int cur_sess, cur_sess_max;		/* number of currently active sessions (including syn_sent) */
+	int cur_sess;				/* number of currently active sessions (including syn_sent) */
 	unsigned maxconn, minconn;		/* max # of active sessions (0 = unlimited), min# for dynamic limit. */
-	int nbpend, nbpend_max;			/* number of pending connections */
+	int nbpend;				/* number of pending connections */
 	int maxqueue;				/* maximum number of pending connections allowed */
+	struct srvcounters counters;		/* statistics counters */
+
 	struct list pendconns;			/* pending connections */
 	struct task *check;                     /* the task associated to the health check processing */
+	struct task *warmup;                    /* the task dedicated to the warmup when slowstart is set */
 
 	struct sockaddr_in addr;		/* the address to connect to */
 	struct sockaddr_in source_addr;		/* the address to which we want to bind for connect() */
 #if defined(CONFIG_HAP_CTTPROXY) || defined(CONFIG_HAP_LINUX_TPROXY)
 	struct sockaddr_in tproxy_addr;		/* non-local address we want to bind to for connect() */
+	char *bind_hdr_name;			/* bind to this header name if defined */
+	int bind_hdr_len;			/* length of the name of the header above */
+	int bind_hdr_occ;			/* occurrence number of header above: >0 = from first, <0 = from end, 0=disabled */
 #endif
 	int iface_len;				/* bind interface name length */
 	char *iface_name;			/* bind interface name or NULL */
@@ -102,14 +120,17 @@ struct server {
 	struct sockaddr_in check_addr;		/* the address to check, if different from <addr> */
 	short check_port;			/* the port to use for the health checks */
 	int health;				/* 0->rise-1 = bad; rise->rise+fall-1 = good */
+	int consecutive_errors;			/* current number of consecutive errors */
 	int rise, fall;				/* time in iterations */
+	int consecutive_errors_limit;		/* number of consecutive errors that triggers an event */
+	short observe, onerror;			/* observing mode: one of HANA_OBS_*; what to do on error: on of ANA_ONERR_* */
 	int inter, fastinter, downinter;	/* checks: time in milliseconds */
 	int slowstart;				/* slowstart time in seconds (ms in the conf) */
 	int result;				/* health-check result : SRV_CHK_* */
 	int curfd;				/* file desc used for current test, or -1 if not in test */
 
 	char *id;				/* just for identification */
-	unsigned uweight, eweight;		/* user-specified weight, and effective weight */
+	unsigned iweight,uweight, eweight;	/* initial weight, user-specified weight, and effective weight */
 	unsigned wscore;			/* weight score, used during srv map computation */
 	unsigned prev_eweight;			/* eweight before last change */
 	unsigned rweight;			/* remainer of weight in the current LB tree */
@@ -117,22 +138,28 @@ struct server {
 	struct eb32_node lb_node;               /* node used for tree-based load balancing */
 	struct eb_root *lb_tree;                /* we want to know in what tree the server is */
 	struct server *next_full;               /* next server in the temporary full list */
+	unsigned lb_nodes_tot;                  /* number of allocated lb_nodes (C-HASH) */
+	unsigned lb_nodes_now;                  /* number of lb_nodes placed in the tree (C-HASH) */
+	struct tree_occ *lb_nodes;              /* lb_nodes_tot * struct tree_occ */
 
-	long long failed_checks, down_trans;	/* failed checks and up-down transitions */
 	unsigned down_time;			/* total time the server was down */
 	time_t last_change;			/* last time, when the state was changed */
+	struct timeval check_start;		/* last health check start time */
+	long check_duration;			/* time in ms took to finish last health check */
+	short check_status, check_code;		/* check result, check code */
+	char check_desc[HCHK_DESC_LEN];		/* health check descritpion */
 
-	long long failed_conns, failed_resp;	/* failed connect() and responses */
-	long long retries, redispatches;		/* retried and redispatched connections */
-	long long failed_secu;			/* blocked responses because of security concerns */
 	struct freq_ctr sess_per_sec;		/* sessions per second on this server */
-	unsigned int sps_max;			/* maximum of new sessions per second seen on this server */
-	long long cum_sess;			/* cumulated number of sessions really sent to this server */
-	long long cum_lbconn;			/* cumulated number of sessions directed by load balancing */
-
-	long long bytes_in;			/* number of bytes transferred from the client to the server */
-	long long bytes_out;			/* number of bytes transferred from the server to the client */
 	int puid;				/* proxy-unique server ID, used for SNMP */
+
+	char *check_data;			/* storage of partial check results */
+	int check_data_len;			/* length of partial check results stored in check_data */
+
+	struct {
+		const char *file;		/* file where the section appears */
+		int line;			/* line where the section appears */
+		struct eb32_node id;		/* place in the tree of used IDs */
+	} conf;					/* config information */
 };
 
 

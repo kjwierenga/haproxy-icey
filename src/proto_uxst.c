@@ -1,7 +1,7 @@
 /*
  * UNIX SOCK_STREAM protocol layer (uxst)
  *
- * Copyright 2000-2008 Willy Tarreau <w@1wt.eu>
+ * Copyright 2000-2009 Willy Tarreau <w@1wt.eu>
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License
@@ -76,19 +76,6 @@ static struct protocol proto_unix = {
 	.disable_all = disable_all_listeners,
 	.listeners = LIST_HEAD_INIT(proto_unix.listeners),
 	.nb_listeners = 0,
-};
-
-const char unix_sock_usage_msg[] =
-        "Unknown command. Please enter one of the following commands only :\n"
-        "  show info   : report information about the running process\n"
-        "  show stat   : report counters for each proxy and server\n"
-        "  show errors : report last request and response errors for each proxy\n"
-        "  show sess   : report the list of current sessions\n"
-	"\n";
-
-const struct chunk unix_sock_usage = {
-        .str = (char *)&unix_sock_usage_msg,
-        .len = sizeof(unix_sock_usage_msg)-1
 };
 
 /********************************
@@ -280,8 +267,8 @@ static int uxst_bind_listener(struct listener *listener)
 	fdtab[fd].cb[DIR_RD].b = fdtab[fd].cb[DIR_WR].b = NULL;
 	fdtab[fd].owner = listener; /* reference the listener instead of a task */
 	fdtab[fd].state = FD_STLISTEN;
-	fdtab[fd].peeraddr = NULL;
-	fdtab[fd].peerlen = 0;
+	fdinfo[fd].peeraddr = NULL;
+	fdinfo[fd].peerlen = 0;
 	return ERR_NONE;
 }
 
@@ -440,52 +427,61 @@ int uxst_event_accept(int fd) {
 		}
 
 		if (fcntl(cfd, F_SETFL, O_NONBLOCK) == -1) {
-			Alert("accept(): cannot set the socket in non blocking mode. Giving up\n");
+			Alert("accept(): cannot set the socket in non blocking mode. Giving up.\n");
 			goto out_free_task;
 		}
 
 		t->process = l->handler;
 		t->context = s;
-		t->nice = -64;  /* we want to boost priority for local stats */
+		t->nice = l->nice;
 
 		s->task = t;
 		s->listener = l;
-		s->fe = NULL;
-		s->be = NULL;
+		s->fe = s->be = l->private;
 
-		s->ana_state = 0;
 		s->req = s->rep = NULL; /* will be allocated later */
 
 		s->si[0].state = s->si[0].prev_state = SI_ST_EST;
 		s->si[0].err_type = SI_ET_NONE;
 		s->si[0].err_loc = NULL;
 		s->si[0].owner = t;
+		s->si[0].update = stream_sock_data_finish;
 		s->si[0].shutr = stream_sock_shutr;
 		s->si[0].shutw = stream_sock_shutw;
 		s->si[0].chk_rcv = stream_sock_chk_rcv;
 		s->si[0].chk_snd = stream_sock_chk_snd;
+		s->si[0].connect = NULL;
+		s->si[0].iohandler = NULL;
 		s->si[0].fd = cfd;
 		s->si[0].flags = SI_FL_NONE;
+		if (s->fe->options2 & PR_O2_INDEPSTR)
+			s->si[0].flags |= SI_FL_INDEP_STR;
 		s->si[0].exp = TICK_ETERNITY;
 
 		s->si[1].state = s->si[1].prev_state = SI_ST_INI;
 		s->si[1].err_type = SI_ET_NONE;
 		s->si[1].err_loc = NULL;
 		s->si[1].owner = t;
-		s->si[1].shutr = stream_sock_shutr;
-		s->si[1].shutw = stream_sock_shutw;
-		s->si[1].chk_rcv = stream_sock_chk_rcv;
-		s->si[1].chk_snd = stream_sock_chk_snd;
 		s->si[1].exp = TICK_ETERNITY;
 		s->si[1].fd = -1; /* just to help with debugging */
 		s->si[1].flags = SI_FL_NONE;
+		if (s->be->options2 & PR_O2_INDEPSTR)
+			s->si[1].flags |= SI_FL_INDEP_STR;
+
+		stream_int_register_handler(&s->si[1], stats_io_handler);
+		s->si[1].private = s;
+		s->si[1].st1 = 0;
+		s->si[1].st0 = STAT_CLI_INIT;
 
 		s->srv = s->prev_srv = s->srv_conn = NULL;
 		s->pend_pos = NULL;
 
+		s->store_count = 0;
+
 		memset(&s->logs, 0, sizeof(s->logs));
 		memset(&s->txn, 0, sizeof(s->txn));
 
+		s->logs.accept_date = date; /* user-visible date for logging */
 		s->logs.tv_accept = now;  /* corrected date for internal use */
 
 		s->data_state = DATA_ST_INIT;
@@ -495,6 +491,7 @@ int uxst_event_accept(int fd) {
 		if ((s->req = pool_alloc2(pool2_buffer)) == NULL)
 			goto out_free_task;
 
+		s->req->size = global.tune.bufsize;
 		buffer_init(s->req);
 		s->req->prod = &s->si[0];
 		s->req->cons = &s->si[1];
@@ -511,11 +508,13 @@ int uxst_event_accept(int fd) {
 		if ((s->rep = pool_alloc2(pool2_buffer)) == NULL)
 			goto out_free_req;
 
+		s->rep->size = global.tune.bufsize;
 		buffer_init(s->rep);
 
 		s->rep->prod = &s->si[1];
 		s->rep->cons = &s->si[0];
 		s->si[0].ob = s->si[1].ib = s->rep;
+		s->rep->analysers = 0;
 
 		s->rep->rto = TICK_ETERNITY;
 		s->rep->cto = TICK_ETERNITY;
@@ -542,8 +541,8 @@ int uxst_event_accept(int fd) {
 		fdtab[cfd].cb[DIR_RD].b = s->req;
 		fdtab[cfd].cb[DIR_WR].f = l->proto->write;
 		fdtab[cfd].cb[DIR_WR].b = s->rep;
-		fdtab[cfd].peeraddr = (struct sockaddr *)&s->cli_addr;
-		fdtab[cfd].peerlen = sizeof(s->cli_addr);
+		fdinfo[cfd].peeraddr = (struct sockaddr *)&s->cli_addr;
+		fdinfo[cfd].peerlen = sizeof(s->cli_addr);
 
 		EV_FD_SET(cfd, DIR_RD);
 
@@ -569,474 +568,6 @@ int uxst_event_accept(int fd) {
  out_close:
 	close(cfd);
 	return 0;
-}
-
-/* Parses the request line in <cmd> and possibly starts dumping stats on
- * s->rep with the hijack bit set. Returns 1 if OK, 0 in case of any error.
- * The line is modified after parsing.
- */
-int unix_sock_parse_request(struct session *s, char *line)
-{
-	char *args[MAX_UXST_ARGS + 1];
-	int arg;
-
-	while (isspace((unsigned char)*line))
-		line++;
-
-	arg = 0;
-	args[arg] = line;
-
-	while (*line && arg < MAX_UXST_ARGS) {
-		if (isspace((unsigned char)*line)) {
-			*line++ = '\0';
-
-			while (isspace((unsigned char)*line))
-				line++;
-
-			args[++arg] = line;
-			continue;
-		}
-
-		line++;
-	}
-
-	while (++arg <= MAX_UXST_ARGS)
-		args[arg] = line;
-
-	if (strcmp(args[0], "show") == 0) {
-		if (strcmp(args[1], "stat") == 0) {
-			if (*args[2] && *args[3] && *args[4]) {
-				s->data_ctx.stats.flags |= STAT_BOUND;
-				s->data_ctx.stats.iid	= atoi(args[2]);
-				s->data_ctx.stats.type	= atoi(args[3]);
-				s->data_ctx.stats.sid	= atoi(args[4]);
-			}
-
-			s->data_ctx.stats.flags |= STAT_SHOW_STAT;
-			s->data_ctx.stats.flags |= STAT_FMT_CSV;
-			s->ana_state = STATS_ST_REP;
-			buffer_install_hijacker(s, s->rep, stats_dump_raw_to_buffer);
-		}
-		else if (strcmp(args[1], "info") == 0) {
-			s->data_ctx.stats.flags |= STAT_SHOW_INFO;
-			s->data_ctx.stats.flags |= STAT_FMT_CSV;
-			s->ana_state = STATS_ST_REP;
-			buffer_install_hijacker(s, s->rep, stats_dump_raw_to_buffer);
-		}
-		else if (strcmp(args[1], "sess") == 0) {
-			s->ana_state = STATS_ST_REP;
-			buffer_install_hijacker(s, s->rep, stats_dump_sess_to_buffer);
-		}
-		else if (strcmp(args[1], "errors") == 0) {
-			if (*args[2])
-				s->data_ctx.errors.iid	= atoi(args[2]);
-			else
-				s->data_ctx.errors.iid	= -1;
-			s->data_ctx.errors.px = NULL;
-			s->ana_state = STATS_ST_REP;
-			buffer_install_hijacker(s, s->rep, stats_dump_errors_to_buffer);
-		}
-		else { /* neither "stat" nor "info" nor "sess" */
-			return 0;
-		}
-	}
-	else { /* not "show" */
-		return 0;
-	}
-	return 1;
-}
-
-/* Processes the stats interpreter on the statistics socket.
- * In order to ease the transition, we simply simulate the server status
- * for now. It only knows states STATS_ST_INIT, STATS_ST_REQ, STATS_ST_REP, and
- * STATS_ST_CLOSE. It removes the AN_REQ_UNIX_STATS bit from req->analysers
- * once done. It always returns 0.
- */
-int uxst_req_analyser_stats(struct session *s, struct buffer *req)
-{
-	char *line, *p;
-
-	switch (s->ana_state) {
-	case STATS_ST_INIT:
-		/* Stats output not initialized yet */
-		memset(&s->data_ctx.stats, 0, sizeof(s->data_ctx.stats));
-		s->data_source = DATA_SRC_STATS;
-		s->ana_state = STATS_ST_REQ;
-		buffer_write_dis(s->req);
-		buffer_shutw_now(s->req);
-		/* fall through */
-
-	case STATS_ST_REQ:
-		/* Now, stats are initialized, hijack is not set, and
-		 * we are waiting for a complete request line.
-		 */
-
-		line = s->req->data;
-		p = memchr(line, '\n', s->req->l);
-
-		if (p) {
-			*p = '\0';
-			if (!unix_sock_parse_request(s, line)) {
-				/* invalid request */
-				stream_int_retnclose(s->req->prod, &unix_sock_usage);
-				s->ana_state = 0;
-				req->analysers = 0;
-				return 0;
-			}
-		}
-
-		/* processing a valid or incomplete request */
-		if ((req->flags & BF_FULL)                    || /* invalid request */
-		    (req->flags & BF_READ_ERROR)              || /* input error */
-		    (req->flags & BF_READ_TIMEOUT)            || /* read timeout */
-		    tick_is_expired(req->analyse_exp, now_ms) || /* request timeout */
-		    (req->flags & BF_SHUTR)) {                   /* input closed */
-			buffer_shutw_now(s->rep);
-			s->ana_state = 0;
-			req->analysers = 0;
-			return 0;
-		}
-		/* don't forward nor abort */
-		req->flags |= BF_READ_DONTWAIT; /* we plan to read small requests */
-		return 0;
-
-	case STATS_ST_REP:
-		/* do nothing while response is being processed */
-		return 0;
-
-	case STATS_ST_CLOSE:
-		/* end of dump */
-		s->req->analysers &= ~AN_REQ_UNIX_STATS;
-		s->ana_state = 0;
-		break;
-	}
-	return 0;
-}
-
-
-/* This function is the unix-stream equivalent of the global process_session().
- * It is currently limited to unix-stream processing on control sockets such as
- * stats, and has no server-side. The two functions should be merged into one
- * once client and server sides are better delimited. Note that the server-side
- * still exists but remains in SI_ST_INI state forever, so that any call is a
- * NOP.
- */
-struct task *uxst_process_session(struct task *t)
-{
-	struct session *s = t->context;
-	int resync;
-	unsigned int rqf_last, rpf_last;
-
-	/* 1a: Check for low level timeouts if needed. We just set a flag on
-	 * stream interfaces when their timeouts have expired.
-	 */
-	if (unlikely(t->state & TASK_WOKEN_TIMER)) {
-		stream_int_check_timeouts(&s->si[0]);
-		buffer_check_timeouts(s->req);
-		buffer_check_timeouts(s->rep);
-	}
-
-	s->req->flags &= ~BF_READ_NOEXP;
-
-	/* copy req/rep flags so that we can detect shutdowns */
-	rqf_last = s->req->flags;
-	rpf_last = s->rep->flags;
-
-	/* 1b: check for low-level errors reported at the stream interface. */
-	if (unlikely(s->si[0].flags & SI_FL_ERR)) {
-		if (s->si[0].state == SI_ST_EST || s->si[0].state == SI_ST_DIS) {
-			s->si[0].shutr(&s->si[0]);
-			s->si[0].shutw(&s->si[0]);
-			stream_int_report_error(&s->si[0]);
-		}
-	}
-
-	/* check buffer timeouts, and close the corresponding stream interfaces
-	 * for future reads or writes. Note: this will also concern upper layers
-	 * but we do not touch any other flag. We must be careful and correctly
-	 * detect state changes when calling them.
-	 */
-	if (unlikely(s->req->flags & (BF_READ_TIMEOUT|BF_WRITE_TIMEOUT))) {
-		if (s->req->flags & BF_READ_TIMEOUT)
-			s->req->prod->shutr(s->req->prod);
-		if (s->req->flags & BF_WRITE_TIMEOUT)
-			s->req->cons->shutw(s->req->cons);
-	}
-
-	if (unlikely(s->rep->flags & (BF_READ_TIMEOUT|BF_WRITE_TIMEOUT))) {
-		if (s->rep->flags & BF_READ_TIMEOUT)
-			s->rep->prod->shutr(s->rep->prod);
-		if (s->rep->flags & BF_WRITE_TIMEOUT)
-			s->rep->cons->shutw(s->rep->cons);
-	}
-
-	/* Check for connection closure */
-
- resync_stream_interface:
-
-	/* nothing special to be done on client side */
-	if (unlikely(s->req->prod->state == SI_ST_DIS))
-		s->req->prod->state = SI_ST_CLO;
-
-	/*
-	 * Note: of the transient states (REQ, CER, DIS), only REQ may remain
-	 * at this point.
-	 */
-
- resync_request:
-	/**** Process layer 7 below ****/
-
-	resync = 0;
-
-	/* Analyse request */
-	if ((s->req->flags & BF_MASK_ANALYSER) ||
-	    (s->req->flags ^ rqf_last) & BF_MASK_STATIC) {
-		unsigned int flags = s->req->flags;
-
-		if (s->req->prod->state >= SI_ST_EST) {
-			/* it's up to the analysers to reset write_ena */
-			buffer_write_ena(s->req);
-
-			/* We will call all analysers for which a bit is set in
-			 * s->req->analysers, following the bit order from LSB
-			 * to MSB. The analysers must remove themselves from
-			 * the list when not needed. This while() loop is in
-			 * fact a cleaner if().
-			 */
-			while (s->req->analysers) {
-				if (s->req->analysers & AN_REQ_UNIX_STATS)
-					if (!uxst_req_analyser_stats(s, s->req))
-						break;
-
-				/* Just make sure that nobody set a wrong flag causing an endless loop */
-				s->req->analysers &= AN_REQ_UNIX_STATS;
-
-				/* we don't want to loop anyway */
-				break;
-			}
-		}
-		s->req->flags &= BF_CLEAR_READ & BF_CLEAR_WRITE & BF_CLEAR_TIMEOUT;
-		flags &= BF_CLEAR_READ & BF_CLEAR_WRITE & BF_CLEAR_TIMEOUT;
-		if ((s->req->flags ^ flags) & BF_MASK_STATIC)
-			resync = 1;
-	}
-
-	/* if noone is interested in analysing data, let's forward everything */
-	if (!s->req->analysers && !(s->req->flags & BF_HIJACK))
-		s->req->send_max = s->req->l;
-
-	/* If noone is interested in analysing data, it's time to forward
-	 * everything. We will wake up from time to time when either send_max
-	 * or to_forward are reached.
-	 */
-	if (!s->req->analysers &&
-	    !(s->req->flags & (BF_HIJACK|BF_SHUTW)) &&
-	    (s->req->prod->state >= SI_ST_EST)) {
-		/* This buffer is freewheeling, there's no analyser nor hijacker
-		 * attached to it. If any data are left in, we'll permit them to
-		 * move.
-		 */
-		buffer_flush(s->req);
-
-		/* If the producer is still connected, we'll schedule large blocks
-		 * of data to be forwarded from the producer to the consumer (which
-		 * might possibly not be connected yet).
-		 */
-		if (!(s->req->flags & BF_SHUTR) &&
-		    s->req->to_forward < FORWARD_DEFAULT_SIZE)
-			buffer_forward(s->req, FORWARD_DEFAULT_SIZE);
-	}
-
-	/* reflect what the L7 analysers have seen last */
-	rqf_last = s->req->flags;
-
-	/*
-	 * Now forward all shutdown requests between both sides of the buffer
-	 */
-
-	/* first, let's check if the request buffer needs to shutdown(write) */
-	if (unlikely((s->req->flags & (BF_SHUTW|BF_SHUTW_NOW|BF_EMPTY|BF_HIJACK|BF_WRITE_ENA|BF_SHUTR)) ==
-		     (BF_EMPTY|BF_WRITE_ENA|BF_SHUTR)))
-		buffer_shutw_now(s->req);
-
-	/* shutdown(write) pending */
-	if (unlikely((s->req->flags & (BF_SHUTW|BF_SHUTW_NOW)) == BF_SHUTW_NOW))
-		s->req->cons->shutw(s->req->cons);
-
-	/* shutdown(write) done on server side, we must stop the client too */
-	if (unlikely((s->req->flags & (BF_SHUTW|BF_SHUTR|BF_SHUTR_NOW)) == BF_SHUTW &&
-		     !s->req->analysers))
-		buffer_shutr_now(s->req);
-
-	/* shutdown(read) pending */
-	if (unlikely((s->req->flags & (BF_SHUTR|BF_SHUTR_NOW)) == BF_SHUTR_NOW))
-		s->req->prod->shutr(s->req->prod);
-
-	/*
-	 * Here we want to check if we need to resync or not.
-	 */
-	if ((s->req->flags ^ rqf_last) & BF_MASK_STATIC)
-		resync = 1;
-
-	s->req->flags &= BF_CLEAR_READ & BF_CLEAR_WRITE & BF_CLEAR_TIMEOUT;
-
-	/* according to benchmarks, it makes sense to resync now */
-	if (s->req->prod->state == SI_ST_DIS)
-		goto resync_stream_interface;
-
-	if (resync)
-		goto resync_request;
-
- resync_response:
-	resync = 0;
-
-	/* Analyse response */
-	if (unlikely(s->rep->flags & BF_HIJACK)) {
-		/* In inject mode, we wake up everytime something has
-		 * happened on the write side of the buffer.
-		 */
-		unsigned int flags = s->rep->flags;
-
-		if ((s->rep->flags & (BF_WRITE_PARTIAL|BF_WRITE_ERROR|BF_SHUTW)) &&
-		    !(s->rep->flags & BF_FULL)) {
-			s->rep->hijacker(s, s->rep);
-		}
-		s->rep->flags &= BF_CLEAR_READ & BF_CLEAR_WRITE & BF_CLEAR_TIMEOUT;
-		flags &= BF_CLEAR_READ & BF_CLEAR_WRITE & BF_CLEAR_TIMEOUT;
-		if ((s->rep->flags ^ flags) & BF_MASK_STATIC)
-			resync = 1;
-	}
-	else if ((s->rep->flags & BF_MASK_ANALYSER) ||
-		 (s->rep->flags ^ rpf_last) & BF_MASK_STATIC) {
-		unsigned int flags = s->rep->flags;
-
-		if (s->rep->prod->state >= SI_ST_EST) {
-			/* it's up to the analysers to reset write_ena */
-			buffer_write_ena(s->rep);
-		}
-		s->rep->flags &= BF_CLEAR_READ & BF_CLEAR_WRITE & BF_CLEAR_TIMEOUT;
-		flags &= BF_CLEAR_READ & BF_CLEAR_WRITE & BF_CLEAR_TIMEOUT;
-		if ((s->rep->flags ^ flags) & BF_MASK_STATIC)
-			resync = 1;
-	}
-
-	/* If noone is interested in analysing data, it's time to forward
-	 * everything. We will wake up from time to time when either send_max
-	 * or to_forward are reached.
-	 */
-	if (!s->rep->analysers &&
-	    !(s->rep->flags & (BF_HIJACK|BF_SHUTW)) &&
-	    (s->rep->prod->state >= SI_ST_EST)) {
-		/* This buffer is freewheeling, there's no analyser nor hijacker
-		 * attached to it. If any data are left in, we'll permit them to
-		 * move.
-		 */
-		buffer_flush(s->rep);
-
-		/* If the producer is still connected, we'll schedule large blocks
-		 * of data to be forwarded from the producer to the consumer (which
-		 * might possibly not be connected yet).
-		 */
-		if (!(s->rep->flags & BF_SHUTR) &&
-		    s->rep->to_forward < FORWARD_DEFAULT_SIZE)
-			buffer_forward(s->rep, FORWARD_DEFAULT_SIZE);
-	}
-
-	/* reflect what the L7 analysers have seen last */
-	rpf_last = s->rep->flags;
-
-	/*
-	 * Now forward all shutdown requests between both sides of the buffer
-	 */
-
-	/*
-	 * FIXME: this is probably where we should produce error responses.
-	 */
-
-	/* first, let's check if the request buffer needs to shutdown(write) */
-	if (unlikely((s->rep->flags & (BF_SHUTW|BF_SHUTW_NOW|BF_EMPTY|BF_HIJACK|BF_WRITE_ENA|BF_SHUTR)) ==
-		     (BF_EMPTY|BF_WRITE_ENA|BF_SHUTR)))
-		buffer_shutw_now(s->rep);
-
-	/* shutdown(write) pending */
-	if (unlikely((s->rep->flags & (BF_SHUTW|BF_SHUTW_NOW)) == BF_SHUTW_NOW))
-		s->rep->cons->shutw(s->rep->cons);
-
-	/* shutdown(write) done on the client side, we must stop the server too */
-	if (unlikely((s->rep->flags & (BF_SHUTW|BF_SHUTR|BF_SHUTR_NOW)) == BF_SHUTW))
-		buffer_shutr_now(s->rep);
-
-	/* shutdown(read) pending */
-	if (unlikely((s->rep->flags & (BF_SHUTR|BF_SHUTR_NOW)) == BF_SHUTR_NOW))
-		s->rep->prod->shutr(s->rep->prod);
-
-	/*
-	 * Here we want to check if we need to resync or not.
-	 */
-	if ((s->rep->flags ^ rpf_last) & BF_MASK_STATIC)
-		resync = 1;
-
-	s->rep->flags &= BF_CLEAR_READ & BF_CLEAR_WRITE & BF_CLEAR_TIMEOUT;
-
-	if (s->req->prod->state == SI_ST_DIS)
-		goto resync_stream_interface;
-
-	if (s->req->flags != rqf_last)
-		goto resync_request;
-
-	if (resync)
-		goto resync_response;
-
-	if (likely(s->rep->cons->state != SI_ST_CLO)) {
-		if (s->rep->cons->state == SI_ST_EST)
-			stream_sock_data_finish(s->rep->cons);
-
-		s->req->flags &= BF_CLEAR_READ & BF_CLEAR_WRITE & BF_CLEAR_TIMEOUT;
-		s->rep->flags &= BF_CLEAR_READ & BF_CLEAR_WRITE & BF_CLEAR_TIMEOUT;
-		s->si[0].prev_state = s->si[0].state;
-		s->si[0].flags &= ~(SI_FL_ERR|SI_FL_EXP);
-
-		/* Trick: if a request is being waiting for the server to respond,
-		 * and if we know the server can timeout, we don't want the timeout
-		 * to expire on the client side first, but we're still interested
-		 * in passing data from the client to the server (eg: POST). Thus,
-		 * we can cancel the client's request timeout if the server's
-		 * request timeout is set and the server has not yet sent a response.
-		 */
-
-		if ((s->rep->flags & (BF_WRITE_ENA|BF_SHUTR)) == 0 &&
-		    (tick_isset(s->req->wex) || tick_isset(s->rep->rex))) {
-			s->req->flags |= BF_READ_NOEXP;
-			s->req->rex = TICK_ETERNITY;
-		}
-
-		t->expire = tick_first(tick_first(s->req->rex, s->req->wex),
-				       tick_first(s->rep->rex, s->rep->wex));
-		if (s->req->analysers)
-			t->expire = tick_first(t->expire, s->req->analyse_exp);
-
-		if (s->si[0].exp)
-			t->expire = tick_first(t->expire, s->si[0].exp);
-
-		return t;
-	}
-
-	actconn--;
-	if (s->listener) {
-		s->listener->nbconn--;
-		if (s->listener->state == LI_FULL &&
-		    s->listener->nbconn < s->listener->maxconn) {
-			/* we should reactivate the listener */
-			EV_FD_SET(s->listener->fd, DIR_RD);
-			s->listener->state = LI_READY;
-		}
-	}
-
-	/* the task MUST not be in the run queue anymore */
-	session_free(s);
-	task_delete(t);
-	task_free(t);
-	return NULL;
 }
 
 __attribute__((constructor))

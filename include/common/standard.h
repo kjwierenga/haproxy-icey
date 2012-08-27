@@ -1,32 +1,34 @@
 /*
-  include/common/standard.h
-  This files contains some general purpose functions and macros.
-
-  Copyright (C) 2000-2009 Willy Tarreau - w@1wt.eu
-  
-  This library is free software; you can redistribute it and/or
-  modify it under the terms of the GNU Lesser General Public
-  License as published by the Free Software Foundation, version 2.1
-  exclusively.
-
-  This library is distributed in the hope that it will be useful,
-  but WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public
-  License along with this library; if not, write to the Free Software
-  Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
-*/
+ * include/common/standard.h
+ * This files contains some general purpose functions and macros.
+ *
+ * Copyright (C) 2000-2010 Willy Tarreau - w@1wt.eu
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation, version 2.1
+ * exclusively.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
+ */
 
 #ifndef _COMMON_STANDARD_H
 #define _COMMON_STANDARD_H
 
 #include <limits.h>
+#include <string.h>
 #include <time.h>
 #include <sys/types.h>
 #include <netinet/in.h>
 #include <common/config.h>
+#include <eb32tree.h>
 #include <proto/fd.h>
 
 /****** string-specific macros and functions ******/
@@ -39,31 +41,6 @@
 /* returns 1 only if only zero or one bit is set in X, which means that X is a
  * power of 2, and 0 otherwise */
 #define POWEROF2(x) (((x) & ((x)-1)) == 0)
-
-/*
- * Gcc >= 3 provides the ability for the programme to give hints to the
- * compiler about what branch of an if is most likely to be taken. This
- * helps the compiler produce the most compact critical paths, which is
- * generally better for the cache and to reduce the number of jumps.
- */
-#if !defined(likely)
-#if __GNUC__ < 3
-#define __builtin_expect(x,y) (x)
-#define likely(x) (x)
-#define unlikely(x) (x)
-#elif __GNUC__ < 4
-/* gcc 3.x does the best job at this */
-#define likely(x) (__builtin_expect((x) != 0, 1))
-#define unlikely(x) (__builtin_expect((x) != 0, 0))
-#else
-/* GCC 4.x is stupid, it performs the comparison then compares it to 1,
- * so we cheat in a dirty way to prevent it from doing this. This will
- * only work with ints and booleans though.
- */
-#define likely(x) (x)
-#define unlikely(x) (__builtin_expect((unsigned long)(x), 0))
-#endif
-#endif
 
 /*
  * copies at most <size-1> chars from <src> to <dst>. Last char is always
@@ -79,7 +56,7 @@ extern int strlcpy2(char *dst, const char *src, int size);
  * the ascii representation for number 'n' in decimal.
  */
 extern char itoa_str[][171];
-extern const char *ultoa_r(unsigned long n, char *buffer, int size);
+extern char *ultoa_r(unsigned long n, char *buffer, int size);
 extern const char *ulltoh_r(unsigned long long n, char *buffer, int size);
 static inline const char *ultoa(unsigned long n)
 {
@@ -142,6 +119,12 @@ extern const char *limit_r(unsigned long n, char *buffer, int size, const char *
 extern int ishex(char s);
 
 /*
+ * Return integer equivalent of character <c> for a hex digit (0-9, a-f, A-F),
+ * otherwise -1.
+ */
+extern int hex2i(int c);
+
+/*
  * Checks <name> for invalid characters. Valid chars are [A-Za-z0-9_:.-]. If an
  * invalid character is found, a pointer to it is returned. If everything is
  * fine, NULL is returned.
@@ -179,6 +162,12 @@ struct sockaddr_in *str2sa(char *str);
  */
 struct sockaddr_in *str2sa_range(char *str, int *low, int *high);
 
+/* converts <str> to a struct in_addr containing a network mask. It can be
+ * passed in dotted form (255.255.255.0) or in CIDR form (24). It returns 1
+ * if the conversion succeeds otherwise non-zero.
+ */
+int str2mask(const char *str, struct in_addr *mask);
+
 /*
  * converts <str> to two struct in_addr* which must be pre-allocated.
  * The format is "addr[/mask]", where "addr" cannot be empty, and mask
@@ -211,6 +200,13 @@ extern const char hextab[];
 char *encode_string(char *start, char *stop,
 		    const char escape, const fd_set *map,
 		    const char *string);
+
+/* Decode an URL-encoded string in-place. The resulting string might
+ * be shorter. If some forbidden characters are found, the conversion is
+ * aborted, the string is truncated before the issue and non-zero is returned,
+ * otherwise the operation returns non-zero indicating success.
+ */
+int url_decode(char *string);
 
 /* This one is 6 times faster than strtoul() on athlon, but does
  * no check at all.
@@ -280,6 +276,52 @@ extern unsigned int strl2uic(const char *s, int len);
 extern int strl2ic(const char *s, int len);
 extern int strl2irc(const char *s, int len, int *ret);
 extern int strl2llrc(const char *s, int len, long long *ret);
+unsigned int inetaddr_host(const char *text);
+unsigned int inetaddr_host_lim(const char *text, const char *stop);
+unsigned int inetaddr_host_lim_ret(const char *text, char *stop, const char **ret);
+
+static inline char *cut_crlf(char *s) {
+
+	while (*s != '\r' || *s == '\n') {
+		char *p = s++;
+
+		if (!*p)
+			return p;
+	}
+
+	*s++ = 0;
+
+	return s;
+}
+
+static inline char *ltrim(char *s, char c) {
+
+	if (c)
+		while (*s == c)
+			s++;
+
+	return s;
+}
+
+static inline char *rtrim(char *s, char c) {
+
+	char *p = s + strlen(s);
+
+	while (p-- > s)
+		if (*p == c)
+			*p = '\0';
+		else
+			break;
+
+	return s;
+}
+
+static inline char *alltrim(char *s, char c) {
+
+	rtrim(s, c);
+
+	return ltrim(s, c);
+}
 
 /* This function converts the time_t value <now> into a broken out struct tm
  * which must be allocated by the caller. It is highly recommended to use this
@@ -291,6 +333,16 @@ static inline void get_localtime(const time_t now, struct tm *tm)
 	localtime_r(&now, tm);
 }
 
+/* This function converts the time_t value <now> into a broken out struct tm
+ * which must be allocated by the caller. It is highly recommended to use this
+ * function intead of gmtime() because that one requires a time_t* which
+ * is not always compatible with tv_sec depending on OS/hardware combinations.
+ */
+static inline void get_gmtime(const time_t now, struct tm *tm)
+{
+	gmtime_r(&now, tm);
+}
+
 /* This function parses a time value optionally followed by a unit suffix among
  * "d", "h", "m", "s", "ms" or "us". It converts the value into the unit
  * expected by the caller. The computation does its best to avoid overflows.
@@ -299,6 +351,7 @@ static inline void get_localtime(const time_t now, struct tm *tm)
  * <ret> is left untouched.
  */
 extern const char *parse_time_err(const char *text, unsigned *ret, unsigned unit_flags);
+extern const char *parse_size_err(const char *text, unsigned *ret);
 
 /* unit flags to pass to parse_time_err */
 #define TIME_UNIT_US   0x0000
@@ -320,5 +373,17 @@ static inline unsigned int mul32hi(unsigned int a, unsigned int b)
 
 /* copies at most <n> characters from <src> and always terminates with '\0' */
 char *my_strndup(const char *src, int n);
+
+/* This function returns the first unused key greater than or equal to <key> in
+ * ID tree <root>. Zero is returned if no place is found.
+ */
+unsigned int get_next_id(struct eb_root *root, unsigned int key);
+
+/* This function compares a sample word possibly followed by blanks to another
+ * clean word. The compare is case-insensitive. 1 is returned if both are equal,
+ * otherwise zero. This intends to be used when checking HTTP headers for some
+ * values.
+ */
+int word_match(const char *sample, int slen, const char *word, int wlen);
 
 #endif /* _COMMON_STANDARD_H */
